@@ -113,8 +113,6 @@ app.get('/dashboard', (req, res) => {
     <head>
       <title>WhatsApp Dashboard</title>
 
-      <meta http-equiv="refresh" content="2">
-
       <style>
 
         * {
