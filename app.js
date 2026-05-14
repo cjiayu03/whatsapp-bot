@@ -67,6 +67,7 @@ app.get('/', (req, res) => {
 /* =========================
    RECEIVE WHATSAPP WEBHOOK
 ========================= */
+console.log("🔥 WEBHOOK HIT");
 app.post('/', (req, res) => {
 
   const timestamp = new Date()
