@@ -9,6 +9,16 @@ const port = process.env.PORT || 3000;
 const verifyToken = process.env.VERIFY_TOKEN;
 
 /* =========================
+   GROUP NUMBERS
+========================= */
+function getGroupNumbers() {
+  return (process.env.GROUP_NUMBERS || '')
+    .split(',')
+    .map(n => n.trim())
+    .filter(Boolean);
+}
+
+/* =========================
    MEMORY STORE
 ========================= */
 let reports = [];
@@ -20,15 +30,12 @@ const VALID_STATUSES = ['OPEN', 'IN_PROGRESS', 'RESOLVED'];
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
-
 function severityEmoji(s) {
   return { low: '🟡', medium: '🟠', critical: '🔴' }[s] || '⚪';
 }
-
 function statusEmoji(s) {
   return { OPEN: '🆕', IN_PROGRESS: '🔧', RESOLVED: '✅' }[s] || '❓';
 }
-
 function formatLocation(r) {
   if (!r.latDeg && !r.locationCode) return 'N/A';
   const latStr = r.latDeg ? `${r.latDeg}°${r.latMin || '00'}'${r.latDir || 'N'}` : '';
@@ -37,21 +44,40 @@ function formatLocation(r) {
 }
 
 /* =========================
-   WHATSAPP SEND FUNCTION
+   SHORT CODE GENERATOR
+   e.g. INC-A3F
 ========================= */
-async function sendWhatsAppMessage(message) {
+function generateShortCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 4; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return 'INC-' + code;
+}
+function ensureUniqueCode() {
+  let code;
+  let attempts = 0;
+  do {
+    code = generateShortCode();
+    attempts++;
+  } while (reports.find(r => r.shortCode === code) && attempts < 100);
+  return code;
+}
+
+/* =========================
+   WHATSAPP SEND (single)
+========================= */
+async function sendWhatsAppMessage(toNumber, message) {
   try {
     const response = await axios.post(
       `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`,
       {
         messaging_product: "whatsapp",
-        to: process.env.TARGET_PHONE,
+        to: toNumber,
         recipient_type: "individual",
         type: "text",
-        text: {
-          body: message,
-          preview_url: false
-        }
+        text: { body: message, preview_url: false }
       },
       {
         headers: {
@@ -60,10 +86,89 @@ async function sendWhatsAppMessage(message) {
         }
       }
     );
-    console.log("WhatsApp sent:", response.data);
+    console.log(`✅ WA sent to ${toNumber}`);
+    return response.data;
   } catch (err) {
-    console.error("WhatsApp error:", err.response?.data || err.message);
+    console.error(`❌ WA error to ${toNumber}:`, err.response?.data || err.message);
   }
+}
+
+/* =========================
+   BROADCAST (all numbers)
+========================= */
+async function broadcast(message, excludeNumber = null) {
+  const numbers = getGroupNumbers().filter(n => n !== excludeNumber);
+  await Promise.all(numbers.map(n => sendWhatsAppMessage(n, message)));
+}
+
+/* =========================
+   PARSE INCOMING COMMANDS
+   INC-XXXX <comment>
+   INC-XXXX RESOLVE
+   INC-XXXX PROGRESS
+   INC-XXXX OPEN
+========================= */
+async function handleIncomingCommand(from, text) {
+  const upper = text.trim().toUpperCase();
+
+  // Check if it starts with INC-
+  const incMatch = text.trim().match(/^(INC-[A-Z0-9]{4})\s*(.*)/i);
+  if (!incMatch) return false;
+
+  const code = incMatch[1].toUpperCase();
+  const rest = incMatch[2].trim();
+
+  const report = reports.find(r => r.shortCode === code);
+  if (!report) {
+    await sendWhatsAppMessage(from, `❌ Incident *${code}* not found. Check the code and try again.`);
+    return true;
+  }
+
+  // Status commands
+  const statusMap = { 'RESOLVE': 'RESOLVED', 'RESOLVED': 'RESOLVED', 'PROGRESS': 'IN_PROGRESS', 'IN_PROGRESS': 'IN_PROGRESS', 'OPEN': 'OPEN', 'REOPEN': 'OPEN' };
+  if (statusMap[rest.toUpperCase()]) {
+    const newStatus = statusMap[rest.toUpperCase()];
+    const old = report.status;
+    report.status = newStatus;
+    report.updatedAt = now();
+    const msg =
+      `${statusEmoji(newStatus)} *Status Update*\n\n` +
+      `${code} — ${report.title}\n` +
+      `${old} → ${newStatus}\n` +
+      `By: +${from}`;
+    await broadcast(msg);
+    return true;
+  }
+
+  // Comment
+  if (rest) {
+    const comment = { id: Date.now(), user: `+${from}`, message: rest, time: now() };
+    report.comments.push(comment);
+    report.updatedAt = now();
+    const msg =
+      `💬 *Comment on ${code}*\n` +
+      `"${report.title}"\n\n` +
+      `+${from}: ${rest}\n\n` +
+      `↩️ Reply: ${code} <message>`;
+    await broadcast(msg, from);
+    // Confirm to sender
+    await sendWhatsAppMessage(from, `✅ Comment added to ${code}`);
+    return true;
+  }
+
+  // Just the code with no action — send incident summary
+  const locStr = formatLocation(report) !== 'N/A' ? `\n📍 ${formatLocation(report)}` : '';
+  await sendWhatsAppMessage(from,
+    `📋 *${code} — ${report.title}*\n\n` +
+    `Severity: ${severityEmoji(report.severity)} ${report.severity.toUpperCase()}\n` +
+    `Status: ${statusEmoji(report.status)} ${report.status}\n` +
+    `Reporter: ${report.reportedBy || '—'}\n` +
+    `Sector: ${report.sector || '—'}` +
+    locStr + '\n\n' +
+    `↩️ Reply: ${code} <message> to comment\n` +
+    `↩️ Reply: ${code} RESOLVE / PROGRESS / OPEN to update status`
+  );
+  return true;
 }
 
 /* =========================
@@ -73,35 +178,45 @@ app.get('/', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-
   if (mode === 'subscribe' && token === verifyToken) {
     console.log('WEBHOOK VERIFIED');
     return res.status(200).send(challenge);
   }
-
   res.redirect('/dashboard');
 });
 
 /* =========================
    RECEIVE WHATSAPP MESSAGES
 ========================= */
-app.post('/', (req, res) => {
+app.post('/', async (req, res) => {
   console.log("🔥 WEBHOOK HIT");
+  res.sendStatus(200); // Respond immediately to Meta
 
   const timestamp = now();
   const value = req.body?.entry?.[0]?.changes?.[0]?.value;
   const message = value?.messages?.[0];
 
-  if (message) {
-    incomingMessages.unshift({
-      time: timestamp,
-      from: message.from,
-      text: message.text?.body || "[non-text]"
-    });
-    incomingMessages = incomingMessages.slice(0, 100);
-  }
+  if (!message) return;
 
-  res.sendStatus(200);
+  const from = message.from;
+  const text = message.text?.body || '';
+
+  // Log incoming
+  incomingMessages.unshift({ time: timestamp, from, text: text || '[non-text]' });
+  incomingMessages = incomingMessages.slice(0, 100);
+
+  if (!text) return;
+
+  // Try to parse as incident command
+  const handled = await handleIncomingCommand(from, text);
+
+  // If not a command and sender is in the group, relay to others
+  if (!handled) {
+    const groupNumbers = getGroupNumbers();
+    if (groupNumbers.includes(from)) {
+      await broadcast(`📨 *+${from}:*\n${text}`, from);
+    }
+  }
 });
 
 /* =========================
@@ -118,8 +233,10 @@ app.post('/api/report', async (req, res) => {
   if (!message) return res.status(400).json({ error: 'Message required' });
   if (!VALID_SEVERITIES.includes(severity)) return res.status(400).json({ error: `Severity must be: ${VALID_SEVERITIES.join(', ')}` });
 
+  const shortCode = ensureUniqueCode();
+
   const report = {
-    id: Date.now(), user, severity, report: message,
+    id: Date.now(), shortCode, user, severity, report: message,
     title: title || message.slice(0, 60), description, assignee,
     priority, status: 'OPEN', source: 'dashboard',
     time: now(), updatedAt: now(), comments: [],
@@ -131,12 +248,12 @@ app.post('/api/report', async (req, res) => {
 
   const locStr = formatLocation(report) !== 'N/A' ? `\n📍 Location: ${formatLocation(report)}` : '';
   const assigneeStr = assignee ? `\n👤 Assignee: @${assignee}` : '';
-  const descStr = description ? `\n\n📋 Description:\n${description}` : '';
+  const descStr = description ? `\n\n📋 ${description}` : '';
 
-  await sendWhatsAppMessage(
-    `🚨 NEW INCIDENT [${incidentType.toUpperCase()}]\n\n` +
+  await broadcast(
+    `🚨 *NEW INCIDENT [${incidentType.toUpperCase()}]*\n\n` +
+    `🔖 Code: *${shortCode}*\n` +
     `Title: ${report.title}\n` +
-    `ID: ${report.id}\n` +
     `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n` +
     `Priority: ${priority.toUpperCase()}\n` +
     `Nature: ${nature}\n` +
@@ -144,7 +261,9 @@ app.post('/api/report', async (req, res) => {
     `Reporter: ${reportedBy}\n` +
     `Status: 🆕 OPEN` +
     locStr + assigneeStr +
-    `\n\n💬 Report: ${message}` + descStr
+    `\n\n💬 ${message}` + descStr +
+    `\n\n↩️ Reply: *${shortCode} <message>* to comment\n` +
+    `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`
   );
 
   res.json({ success: true, report });
@@ -156,33 +275,31 @@ app.post('/api/report', async (req, res) => {
 app.patch('/api/reports/:id', (req, res) => {
   const report = reports.find(r => String(r.id) === String(req.params.id));
   if (!report) return res.status(404).json({ error: 'Incident not found' });
-
   ['title','description','assignee','priority','severity','incidentType','sector',
    'latDeg','latMin','latDir','locationCode','nature','reportedBy']
     .forEach(k => { if (req.body[k] !== undefined) report[k] = req.body[k]; });
-
   report.updatedAt = now();
   res.json({ success: true, report });
 });
 
 /* =========================
-   API: UPDATE INCIDENT STATUS
+   API: UPDATE STATUS
 ========================= */
 app.post('/api/reports/:id/status', async (req, res) => {
   const { status, user = 'dashboard' } = req.body;
   if (!VALID_STATUSES.includes(status)) return res.status(400).json({ error: `Status must be: ${VALID_STATUSES.join(', ')}` });
-
   const report = reports.find(r => String(r.id) === String(req.params.id));
   if (!report) return res.status(404).json({ error: 'Incident not found' });
-
   const old = report.status;
   report.status = status;
   report.updatedAt = now();
-
-  await sendWhatsAppMessage(
-    `${statusEmoji(status)} STATUS UPDATE\n\nIncident ${req.params.id}\n${old} → ${status}\nBy: ${user}`
+  await broadcast(
+    `${statusEmoji(status)} *Status Update*\n\n` +
+    `${report.shortCode} — ${report.title}\n` +
+    `${old} → ${status}\n` +
+    `By: ${user} (dashboard)\n\n` +
+    `↩️ Reply: *${report.shortCode} <message>* to comment`
   );
-
   res.json({ success: true, report });
 });
 
@@ -192,23 +309,22 @@ app.post('/api/reports/:id/status', async (req, res) => {
 app.post('/api/reports/:id/comment', async (req, res) => {
   const { message, user = 'dashboard' } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
-
   const report = reports.find(r => String(r.id) === String(req.params.id));
   if (!report) return res.status(404).json({ error: 'Incident not found' });
-
   const comment = { id: Date.now(), user, message, time: now() };
   report.comments.push(comment);
   report.updatedAt = now();
-
-  await sendWhatsAppMessage(
-    `💬 COMMENT on "${report.title || req.params.id}"\n\n@${user}: ${message}`
+  await broadcast(
+    `💬 *Comment on ${report.shortCode}*\n` +
+    `"${report.title}"\n\n` +
+    `${user} (dashboard): ${message}\n\n` +
+    `↩️ Reply: *${report.shortCode} <message>* to respond`
   );
-
   res.json({ success: true, comment });
 });
 
 /* =========================
-   API: GET ALL REPORTS
+   API: GET REPORTS
 ========================= */
 app.get('/api/reports', (req, res) => res.json(reports));
 
@@ -216,6 +332,13 @@ app.get('/api/reports', (req, res) => res.json(reports));
    API: GET INCOMING MESSAGES
 ========================= */
 app.get('/api/messages', (req, res) => res.json(incomingMessages));
+
+/* =========================
+   API: GET / UPDATE GROUP NUMBERS
+========================= */
+app.get('/api/group-numbers', (req, res) => {
+  res.json({ numbers: getGroupNumbers() });
+});
 
 /* =========================
    DASHBOARD HTML
@@ -231,138 +354,36 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg:#07090f;
-      --surface:#0c1018;
-      --surface2:#111722;
-      --surface3:#161e2c;
-      --border:#1a2538;
-      --border2:#223048;
-      --text:#dce8f5;
-      --muted:#3d5470;
-      --muted2:#5a7a9a;
-      --accent:#25d366;
-      --accent2:#128c4a;
-      --accent-blue:#4f8ef7;
-      --sev-low-bg:#071a0f;
-      --sev-low:#34d399;
-      --sev-med-bg:#1a0f00;
-      --sev-med:#fb923c;
-      --sev-crit-bg:#1a0505;
-      --sev-crit:#f87171;
-      --st-open-bg:#04122b;
-      --st-open:#60a5fa;
-      --st-prog-bg:#1a1200;
-      --st-prog:#fbbf24;
-      --st-res-bg:#071a0f;
-      --st-res:#34d399;
+      --bg:#07090f; --surface:#0c1018; --surface2:#111722; --surface3:#161e2c;
+      --border:#1a2538; --border2:#223048; --text:#dce8f5;
+      --muted:#3d5470; --muted2:#5a7a9a;
+      --accent:#25d366; --accent2:#128c4a;
+      --sev-low-bg:#071a0f; --sev-low:#34d399;
+      --sev-med-bg:#1a0f00; --sev-med:#fb923c;
+      --sev-crit-bg:#1a0505; --sev-crit:#f87171;
+      --st-open-bg:#04122b; --st-open:#60a5fa;
+      --st-prog-bg:#1a1200; --st-prog:#fbbf24;
+      --st-res-bg:#071a0f; --st-res:#34d399;
     }
-
     *,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
+    body { background:var(--bg); font-family:'Inter','Segoe UI',sans-serif; color:var(--text); min-height:100vh; overflow:hidden; }
 
-    body {
-      background:var(--bg);
-      font-family:'Inter','Segoe UI',sans-serif;
-      color:var(--text);
-      min-height:100vh;
-      overflow:hidden;
-    }
-
-    /* ── HEADER ── */
-    .header {
-      background:var(--surface);
-      border-bottom:1px solid var(--border);
-      padding:0 24px;
-      height:56px;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      position:sticky;
-      top:0;
-      z-index:10;
-    }
-    .logo {
-      font-family:'Roboto Mono',monospace;
-      font-size:13px;
-      font-weight:600;
-      letter-spacing:.12em;
-      text-transform:uppercase;
-      display:flex;
-      align-items:center;
-      gap:10px;
-    }
-    .logo-icon {
-      width:28px;
-      height:28px;
-      background:linear-gradient(135deg,#25d366,#128c4a);
-      border-radius:7px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-size:14px;
-      flex-shrink:0;
-    }
-    .pulse-dot {
-      width:7px;
-      height:7px;
-      border-radius:50%;
-      background:#ef4444;
-      animation:pulse 2s infinite;
-    }
-    @keyframes pulse {
-      0%{box-shadow:0 0 0 0 rgba(239,68,68,.5)}
-      70%{box-shadow:0 0 0 8px rgba(239,68,68,0)}
-      100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}
-    }
+    .header { background:var(--surface); border-bottom:1px solid var(--border); padding:0 24px; height:56px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:10; }
+    .logo { font-family:'Roboto Mono',monospace; font-size:13px; font-weight:600; letter-spacing:.12em; text-transform:uppercase; display:flex; align-items:center; gap:10px; }
+    .logo-icon { width:28px; height:28px; background:linear-gradient(135deg,#25d366,#128c4a); border-radius:7px; display:flex; align-items:center; justify-content:center; font-size:14px; flex-shrink:0; }
+    .pulse-dot { width:7px; height:7px; border-radius:50%; background:#ef4444; animation:pulse 2s infinite; }
+    @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(239,68,68,.5)} 70%{box-shadow:0 0 0 8px rgba(239,68,68,0)} 100%{box-shadow:0 0 0 0 rgba(239,68,68,0)} }
     .header-right { display:flex; align-items:center; gap:14px; }
     .ts { font-family:'Roboto Mono',monospace; font-size:11px; color:var(--muted2); }
 
-    /* ── LAYOUT ── */
-    .layout {
-      display:flex;
-      height:calc(100vh - 57px);
-    }
+    .layout { display:flex; height:calc(100vh - 57px); }
 
-    /* ── LEFT PANEL ── */
-    .left-panel {
-      width:300px;
-      min-width:240px;
-      border-right:1px solid var(--border);
-      display:flex;
-      flex-direction:column;
-      overflow:hidden;
-    }
+    .left-panel { width:300px; min-width:240px; border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
     .panel-tools { padding:10px; border-bottom:1px solid var(--border); }
-    .search {
-      width:100%;
-      background:var(--surface2);
-      border:1px solid var(--border2);
-      border-radius:6px;
-      padding:8px 11px;
-      color:var(--text);
-      font-family:'Inter',sans-serif;
-      font-size:13px;
-      outline:none;
-    }
+    .search { width:100%; background:var(--surface2); border:1px solid var(--border2); border-radius:6px; padding:8px 11px; color:var(--text); font-family:'Inter',sans-serif; font-size:13px; outline:none; }
     .search:focus { border-color:var(--accent); }
-    .chips {
-      padding:8px 10px;
-      border-bottom:1px solid var(--border);
-      display:flex;
-      gap:4px;
-      flex-wrap:wrap;
-    }
-    .chip {
-      padding:3px 9px;
-      border-radius:20px;
-      font-size:10px;
-      font-weight:600;
-      cursor:pointer;
-      border:1px solid var(--border2);
-      color:var(--muted2);
-      background:none;
-      font-family:'Inter',sans-serif;
-      letter-spacing:.04em;
-    }
+    .chips { padding:8px 10px; border-bottom:1px solid var(--border); display:flex; gap:4px; flex-wrap:wrap; }
+    .chip { padding:3px 9px; border-radius:20px; font-size:10px; font-weight:600; cursor:pointer; border:1px solid var(--border2); color:var(--muted2); background:none; font-family:'Inter',sans-serif; letter-spacing:.04em; }
     .chip:hover { border-color:var(--accent); color:var(--accent); }
     .chip.on { background:var(--accent); border-color:var(--accent); color:#000; }
 
@@ -370,139 +391,41 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .inc-list::-webkit-scrollbar { width:3px; }
     .inc-list::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
 
-    /* ── INCIDENT CARD ── */
-    .card {
-      padding:10px 11px 10px 16px;
-      border-radius:7px;
-      border:1px solid transparent;
-      margin-bottom:3px;
-      cursor:pointer;
-      position:relative;
-    }
+    .card { padding:10px 11px 10px 16px; border-radius:7px; border:1px solid transparent; margin-bottom:3px; cursor:pointer; position:relative; }
     .card:hover { background:var(--surface2); border-color:var(--border2); }
     .card.on { background:var(--surface2); border-color:var(--accent); }
-    .sev-bar {
-      position:absolute;
-      left:5px;
-      top:7px;
-      bottom:7px;
-      width:3px;
-      border-radius:2px;
-    }
+    .sev-bar { position:absolute; left:5px; top:7px; bottom:7px; width:3px; border-radius:2px; }
     .sev-bar.low { background:var(--sev-low); }
     .sev-bar.medium { background:var(--sev-med); }
     .sev-bar.critical { background:var(--sev-crit); }
-    .card-title {
-      font-size:12px;
-      font-weight:600;
-      margin-bottom:5px;
-      white-space:nowrap;
-      overflow:hidden;
-      text-overflow:ellipsis;
-    }
+    .card-title { font-size:12px; font-weight:600; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .card-code { font-family:'Roboto Mono',monospace; font-size:9px; color:var(--accent); margin-bottom:5px; }
     .card-meta { display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
 
-    /* ── BADGES ── */
-    .badge {
-      display:inline-flex;
-      align-items:center;
-      padding:2px 6px;
-      border-radius:4px;
-      font-size:9px;
-      font-weight:700;
-      font-family:'Roboto Mono',monospace;
-      letter-spacing:.06em;
-      text-transform:uppercase;
-      white-space:nowrap;
-    }
-    .b-low    { background:var(--sev-low-bg); color:var(--sev-low); }
+    .badge { display:inline-flex; align-items:center; padding:2px 6px; border-radius:4px; font-size:9px; font-weight:700; font-family:'Roboto Mono',monospace; letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+    .b-low { background:var(--sev-low-bg); color:var(--sev-low); }
     .b-medium { background:var(--sev-med-bg); color:var(--sev-med); }
     .b-critical { background:var(--sev-crit-bg); color:var(--sev-crit); }
-    .b-OPEN       { background:var(--st-open-bg); color:var(--st-open); }
+    .b-OPEN { background:var(--st-open-bg); color:var(--st-open); }
     .b-IN_PROGRESS { background:var(--st-prog-bg); color:var(--st-prog); }
-    .b-RESOLVED   { background:var(--st-res-bg); color:var(--st-res); }
-    .b-src { background:var(--surface3); border:1px solid var(--border2); color:var(--muted2); }
+    .b-RESOLVED { background:var(--st-res-bg); color:var(--st-res); }
     .b-wa { background:#0a2016; color:#25d366; border:1px solid #0d3d20; }
 
-    /* ── DETAIL PANEL ── */
-    .detail-panel {
-      flex:1;
-      display:flex;
-      flex-direction:column;
-      overflow:hidden;
-    }
+    .detail-panel { flex:1; display:flex; flex-direction:column; overflow:hidden; }
 
-    /* Tab navigation for detail panel */
-    .detail-tabs {
-      display:flex;
-      border-bottom:1px solid var(--border);
-      background:var(--surface);
-      flex-shrink:0;
-    }
-    .detail-tab {
-      padding:12px 18px;
-      font-size:11px;
-      font-weight:600;
-      letter-spacing:.06em;
-      text-transform:uppercase;
-      color:var(--muted2);
-      cursor:pointer;
-      border-bottom:2px solid transparent;
-      font-family:'Inter',sans-serif;
-      background:none;
-      border-top:none;
-      border-left:none;
-      border-right:none;
-    }
+    .detail-tabs { display:flex; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0; }
+    .detail-tab { padding:12px 18px; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase; color:var(--muted2); cursor:pointer; border-bottom:2px solid transparent; font-family:'Inter',sans-serif; background:none; border-top:none; border-left:none; border-right:none; }
     .detail-tab.on { color:var(--accent); border-bottom-color:var(--accent); }
     .detail-tab:hover { color:var(--text); }
 
-    .detail-head {
-      padding:16px 22px 14px;
-      background:var(--surface);
-      border-bottom:1px solid var(--border);
-      flex-shrink:0;
-    }
-    .detail-title-row {
-      display:flex;
-      align-items:flex-start;
-      justify-content:space-between;
-      gap:12px;
-      margin-bottom:10px;
-    }
-    .detail-title {
-      font-family:'Roboto Mono',monospace;
-      font-size:15px;
-      font-weight:600;
-      line-height:1.35;
-      flex:1;
-    }
-    .detail-id {
-      font-family:'Roboto Mono',monospace;
-      font-size:10px;
-      color:var(--muted2);
-      flex-shrink:0;
-      margin-top:3px;
-    }
+    .detail-head { padding:16px 22px 14px; background:var(--surface); border-bottom:1px solid var(--border); flex-shrink:0; }
+    .detail-title-row { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:10px; }
+    .detail-title { font-family:'Roboto Mono',monospace; font-size:15px; font-weight:600; line-height:1.35; flex:1; }
+    .detail-id { font-family:'Roboto Mono',monospace; font-size:10px; color:var(--muted2); flex-shrink:0; margin-top:3px; }
     .detail-badges { display:flex; gap:5px; flex-wrap:wrap; margin-bottom:12px; }
     .action-row { display:flex; gap:7px; flex-wrap:wrap; }
 
-    /* ── BUTTONS ── */
-    .btn {
-      display:inline-flex;
-      align-items:center;
-      gap:5px;
-      padding:7px 13px;
-      border-radius:6px;
-      font-size:11px;
-      font-weight:700;
-      cursor:pointer;
-      border:none;
-      font-family:'Inter',sans-serif;
-      letter-spacing:.04em;
-      text-transform:uppercase;
-      white-space:nowrap;
-    }
+    .btn { display:inline-flex; align-items:center; gap:5px; padding:7px 13px; border-radius:6px; font-size:11px; font-weight:700; cursor:pointer; border:none; font-family:'Inter',sans-serif; letter-spacing:.04em; text-transform:uppercase; white-space:nowrap; }
     .btn-primary { background:var(--accent); color:#000; }
     .btn-primary:hover { background:var(--accent2); color:#fff; }
     .btn-ghost { background:var(--surface2); color:var(--text); border:1px solid var(--border2); }
@@ -514,178 +437,57 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .btn-danger { background:var(--sev-crit-bg); color:var(--sev-crit); border:1px solid #5a1010; }
     .btn-danger:hover { background:#2a0808; }
 
-    /* ── FORM FIELD DISPLAY (detail view) ── */
-    .dv-scroll {
-      flex:1;
-      overflow-y:auto;
-      padding:24px 28px;
-      display:flex;
-      flex-direction:column;
-      gap:20px;
-    }
+    .dv-scroll { flex:1; overflow-y:auto; padding:24px 28px; display:flex; flex-direction:column; gap:20px; }
     .dv-scroll::-webkit-scrollbar { width:3px; }
     .dv-scroll::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
-
     .dv-row { display:grid; gap:14px; }
     .dv-row.col2 { grid-template-columns:1fr 1fr; }
     .dv-row.col3 { grid-template-columns:1fr 1fr 1fr; }
     .dv-row.col1 { grid-template-columns:1fr; }
-
     .dv-field { display:flex; flex-direction:column; gap:5px; }
-    .dv-label {
-      font-size:9px;
-      text-transform:uppercase;
-      letter-spacing:.12em;
-      color:var(--muted2);
-      font-weight:700;
-    }
+    .dv-label { font-size:9px; text-transform:uppercase; letter-spacing:.12em; color:var(--muted2); font-weight:700; }
     .dv-label.req::after { content:' *'; color:var(--sev-crit); }
-
-    .dv-val {
-      background:var(--surface2);
-      border:1px solid var(--border2);
-      border-radius:7px;
-      padding:10px 14px;
-      font-size:13px;
-      color:var(--text);
-      font-family:'Inter','Segoe UI',sans-serif;
-      min-height:40px;
-      display:flex;
-      align-items:center;
-    }
+    .dv-val { background:var(--surface2); border:1px solid var(--border2); border-radius:7px; padding:10px 14px; font-size:13px; color:var(--text); font-family:'Inter','Segoe UI',sans-serif; min-height:40px; display:flex; align-items:center; }
     .dv-val.mono { font-family:'Roboto Mono','Courier New',monospace; font-size:12px; }
-    .dv-val.muted { color:var(--muted2); }
     .dv-val.prose { align-items:flex-start; min-height:64px; line-height:1.6; color:#9ab5cf; }
-
-    .dv-input {
-      width:100%;
-      background:var(--surface2);
-      border:1px solid var(--border2);
-      border-radius:7px;
-      padding:10px 14px;
-      font-size:13px;
-      color:var(--text);
-      font-family:'Inter','Segoe UI',sans-serif;
-      min-height:40px;
-      outline:none;
-      transition:border-color .15s;
-    }
+    .dv-val.code { background:#0a1a0d; border-color:#1a4a25; color:var(--accent); font-family:'Roboto Mono',monospace; font-size:15px; font-weight:700; letter-spacing:.1em; }
+    .dv-input { width:100%; background:var(--surface2); border:1px solid var(--border2); border-radius:7px; padding:10px 14px; font-size:13px; color:var(--text); font-family:'Inter','Segoe UI',sans-serif; min-height:40px; outline:none; transition:border-color .15s; }
     .dv-input:focus { border-color:var(--accent); }
     .dv-input.mono { font-family:'Roboto Mono','Courier New',monospace; font-size:12px; }
     .dv-input option { background:var(--surface2); }
-
     .dv-section { display:flex; flex-direction:column; gap:14px; }
-    .dv-section-head {
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      border-bottom:1px solid var(--border);
-      padding-bottom:10px;
-    }
-    .dv-section-title {
-      font-size:11px;
-      font-weight:700;
-      letter-spacing:.1em;
-      text-transform:uppercase;
-      color:var(--text);
-      display:flex;
-      align-items:center;
-      gap:7px;
-    }
-    .dv-section-title::before {
-      content:'';
-      width:3px;
-      height:14px;
-      background:var(--accent);
-      border-radius:2px;
-      display:block;
-    }
+    .dv-section-head { display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); padding-bottom:10px; }
+    .dv-section-title { font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--text); display:flex; align-items:center; gap:7px; }
+    .dv-section-title::before { content:''; width:3px; height:14px; background:var(--accent); border-radius:2px; display:block; }
 
-    /* ── COMMENTS ── */
     .comment-thread { display:flex; flex-direction:column; gap:8px; }
-    .comment-item {
-      display:flex;
-      gap:10px;
-      padding:10px 12px;
-      background:var(--surface2);
-      border:1px solid var(--border);
-      border-radius:8px;
-    }
-    .av {
-      width:28px;
-      height:28px;
-      border-radius:50%;
-      background:var(--st-open-bg);
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      font-size:10px;
-      font-weight:700;
-      flex-shrink:0;
-      font-family:'Roboto Mono',monospace;
-      color:var(--st-open);
-    }
+    .comment-item { display:flex; gap:10px; padding:10px 12px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; }
+    .av { width:28px; height:28px; border-radius:50%; background:var(--st-open-bg); display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; flex-shrink:0; font-family:'Roboto Mono',monospace; color:var(--st-open); }
+    .av.wa { background:#0a2016; color:#25d366; }
     .c-user { font-size:12px; font-weight:600; color:var(--accent); }
     .c-time { font-size:10px; color:var(--muted2); font-family:'Roboto Mono',monospace; }
     .c-text { font-size:13px; line-height:1.5; color:#9ab5cf; margin-top:3px; }
 
-    .comment-bar {
-      display:flex;
-      gap:8px;
-      padding:12px 20px;
-      border-top:1px solid var(--border);
-      background:var(--surface);
-      flex-shrink:0;
-    }
-    .comment-input {
-      flex:1;
-      background:var(--surface2);
-      border:1px solid var(--border2);
-      border-radius:7px;
-      padding:9px 12px;
-      color:var(--text);
-      font-family:'Inter',sans-serif;
-      font-size:13px;
-      outline:none;
-      resize:none;
-      height:38px;
-      transition:border-color .15s, height .15s;
-    }
+    .comment-bar { display:flex; gap:8px; padding:12px 20px; border-top:1px solid var(--border); background:var(--surface); flex-shrink:0; }
+    .comment-input { flex:1; background:var(--surface2); border:1px solid var(--border2); border-radius:7px; padding:9px 12px; color:var(--text); font-family:'Inter',sans-serif; font-size:13px; outline:none; resize:none; height:38px; transition:border-color .15s, height .15s; }
     .comment-input:focus { border-color:var(--accent); height:68px; }
 
-    /* ── WA LOG PANEL ── */
-    .wa-log-panel {
-      flex:1;
-      overflow-y:auto;
-      padding:20px 24px;
-      display:flex;
-      flex-direction:column;
-      gap:10px;
-    }
+    .wa-log-panel { flex:1; overflow-y:auto; padding:20px 24px; display:flex; flex-direction:column; gap:10px; }
     .wa-log-panel::-webkit-scrollbar { width:3px; }
     .wa-log-panel::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
-    .wa-msg {
-      display:flex;
-      gap:10px;
-      padding:12px 14px;
-      background:var(--surface2);
-      border:1px solid var(--border);
-      border-radius:8px;
-    }
+    .wa-msg { display:flex; gap:10px; padding:12px 14px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; }
     .wa-from { font-size:12px; font-weight:600; color:var(--accent); font-family:'Roboto Mono',monospace; }
     .wa-text { font-size:13px; color:#9ab5cf; margin-top:3px; line-height:1.5; }
     .wa-time { font-size:10px; color:var(--muted2); font-family:'Roboto Mono',monospace; margin-top:4px; }
 
-    /* ── EMPTY STATE ── */
-    .empty {
-      flex:1;
-      display:flex;
-      flex-direction:column;
-      align-items:center;
-      justify-content:center;
-      gap:10px;
-      color:var(--muted2);
-    }
+    /* Group numbers panel */
+    .group-panel { flex:1; overflow-y:auto; padding:24px 28px; display:flex; flex-direction:column; gap:16px; }
+    .num-item { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; }
+    .num-val { font-family:'Roboto Mono',monospace; font-size:13px; color:var(--accent); }
+    .num-hint { font-size:11px; color:var(--muted2); margin-top:16px; line-height:1.7; background:var(--surface2); border:1px solid var(--border); border-radius:8px; padding:14px 16px; }
+    .num-hint code { background:var(--surface3); padding:2px 6px; border-radius:4px; font-family:'Roboto Mono',monospace; font-size:11px; color:var(--accent); }
+
+    .empty { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; color:var(--muted2); }
   </style>
 </head>
 <body>
@@ -703,7 +505,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <div class="layout">
-  <!-- LEFT: Incident List -->
   <div class="left-panel">
     <div class="panel-tools">
       <input class="search" id="search" placeholder="Search incidents…">
@@ -720,7 +521,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     <div class="inc-list" id="inc-list"></div>
   </div>
 
-  <!-- RIGHT: Detail Panel -->
   <div class="detail-panel" id="detail-panel">
     <div class="empty">
       <div style="font-size:40px;opacity:.2;">⌖</div>
@@ -732,124 +532,118 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <script>
 (function () {
-  var all = [], incomingMsgs = [], activeFilter = '', selectedId = null, activeTab = 'incident';
+  var all = [], incomingMsgs = [], groupNumbers = [];
+  var activeFilter = '', selectedId = null, activeTab = 'incident';
 
-  function esc(s) {
-    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  }
-  function ini(n) {
-    return String(n || '?').replace('@','').slice(0,2).toUpperCase();
-  }
-  function coords(r) {
-    if (!r.latDeg) return null;
-    return r.latDeg + String.fromCharCode(176) + (r.latMin || '00') + "'" + (r.latDir || 'N');
-  }
+  function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function ini(n) { return String(n||'?').replace(/[+@]/g,'').slice(0,2).toUpperCase(); }
+  function isWaSource(user) { return user && user.startsWith('+'); }
+
   function field(label, value, cls, req) {
-    var lbl = '<div class="dv-label' + (req ? ' req' : '') + '">' + label + '</div>';
-    var v = '<div class="dv-val' + (cls ? ' ' + cls : '') + '">' + esc(value || '—') + '</div>';
-    return '<div class="dv-field">' + lbl + v + '</div>';
+    return '<div class="dv-field">' +
+      '<div class="dv-label' + (req?' req':'') + '">' + label + '</div>' +
+      '<div class="dv-val' + (cls?' '+cls:'') + '">' + esc(value||'—') + '</div>' +
+    '</div>';
   }
-  function row(cols, content) {
-    return '<div class="dv-row col' + cols + '">' + content + '</div>';
-  }
+  function row(cols, content) { return '<div class="dv-row col'+cols+'">' + content + '</div>'; }
 
-  /* ── LOAD DATA ── */
+  /* ── LOAD ── */
   function load() {
-    fetch('/api/reports').then(function(r){ return r.json(); }).then(function(data){
+    fetch('/api/reports').then(r=>r.json()).then(data=>{
       all = data;
       document.getElementById('ts').textContent = 'UPDATED ' + new Date().toLocaleTimeString();
       renderList();
       if (selectedId) {
-        var r = all.find(function(r){ return String(r.id) === String(selectedId); });
-        if (r) renderDetail(r);
+        var r = all.find(r=>String(r.id)===String(selectedId));
+        if (r && activeTab === 'incident') renderDetail(r);
       }
-    }).catch(function(e){ console.error(e); });
+    }).catch(console.error);
 
-    fetch('/api/messages').then(function(r){ return r.json(); }).then(function(data){
+    fetch('/api/messages').then(r=>r.json()).then(data=>{
       incomingMsgs = data;
-      if (activeTab === 'incoming') renderIncomingTab();
-    }).catch(function(e){ console.error(e); });
+    }).catch(console.error);
+
+    fetch('/api/group-numbers').then(r=>r.json()).then(data=>{
+      groupNumbers = data.numbers || [];
+    }).catch(console.error);
   }
 
   /* ── FILTER CHIPS ── */
-  document.querySelectorAll('.chip').forEach(function(c){
+  document.querySelectorAll('.chip').forEach(c=>{
     c.addEventListener('click', function(){
       activeFilter = c.dataset.f;
-      document.querySelectorAll('.chip').forEach(function(x){ x.classList.remove('on'); });
+      document.querySelectorAll('.chip').forEach(x=>x.classList.remove('on'));
       c.classList.add('on');
       renderList();
     });
   });
-
   document.getElementById('search').addEventListener('input', renderList);
 
   /* ── RENDER LIST ── */
   function renderList() {
-    var q = (document.getElementById('search').value || '').toLowerCase();
-    var list = all.filter(function(r){
-      if (activeFilter === 'critical' || activeFilter === 'medium' || activeFilter === 'low') {
-        if (r.severity !== activeFilter) return false;
+    var q = (document.getElementById('search').value||'').toLowerCase();
+    var list = all.filter(r=>{
+      if (activeFilter==='critical'||activeFilter==='medium'||activeFilter==='low') {
+        if (r.severity!==activeFilter) return false;
       } else if (activeFilter) {
-        if (r.status !== activeFilter) return false;
+        if (r.status!==activeFilter) return false;
       }
       if (q) {
-        var hay = [r.title, r.report, r.user, r.assignee, r.incidentType, r.nature, r.reportedBy, r.sector, r.locationCode].join(' ').toLowerCase();
+        var hay = [r.title,r.report,r.user,r.shortCode,r.incidentType,r.nature,r.reportedBy,r.sector,r.locationCode].join(' ').toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
-
     var el = document.getElementById('inc-list');
     if (!list.length) {
       el.innerHTML = '<div style="padding:20px;color:var(--muted2);font-size:13px;text-align:center;">No incidents match</div>';
       return;
     }
-    el.innerHTML = list.map(function(r){
-      var active = String(r.id) === String(selectedId) ? ' on' : '';
-      var prefix = r.incidentType ? '[' + esc(r.incidentType) + '] ' : '';
-      var t = (r.time || '').slice(5, 16);
-      return '<div class="card' + active + '" data-id="' + r.id + '">' +
-        '<div class="sev-bar ' + esc(r.severity) + '"></div>' +
-        '<div class="card-title">' + prefix + esc(r.title || r.report) + '</div>' +
+    el.innerHTML = list.map(r=>{
+      var active = String(r.id)===String(selectedId)?' on':'';
+      var prefix = r.incidentType ? '['+esc(r.incidentType)+'] ' : '';
+      var t = (r.time||'').slice(5,16);
+      return '<div class="card'+active+'" data-id="'+r.id+'">' +
+        '<div class="sev-bar '+esc(r.severity)+'"></div>' +
+        '<div class="card-code">'+esc(r.shortCode||'—')+'</div>' +
+        '<div class="card-title">'+prefix+esc(r.title||r.report)+'</div>' +
         '<div class="card-meta">' +
-          '<span class="badge b-' + esc(r.severity) + '">' + esc(r.severity) + '</span>' +
-          '<span class="badge b-' + esc(r.status) + '">' + r.status.replace('_',' ') + '</span>' +
-          '<span style="font-size:10px;color:var(--muted2);margin-left:auto;">' + t + '</span>' +
+          '<span class="badge b-'+esc(r.severity)+'">'+esc(r.severity)+'</span>' +
+          '<span class="badge b-'+esc(r.status)+'">'+r.status.replace('_',' ')+'</span>' +
+          '<span style="font-size:10px;color:var(--muted2);margin-left:auto;">'+t+'</span>' +
         '</div></div>';
     }).join('');
   }
 
-  /* Event delegation for incident list */
   document.getElementById('inc-list').addEventListener('click', function(e){
     var card = e.target.closest('[data-id]');
     if (!card) return;
     selectedId = card.dataset.id;
     activeTab = 'incident';
     renderList();
-    var r = all.find(function(r){ return String(r.id) === String(selectedId); });
+    var r = all.find(r=>String(r.id)===String(selectedId));
     if (r) renderDetail(r);
   });
 
-  /* ── NEW INCIDENT ── */
   document.getElementById('new-btn').addEventListener('click', function(){
-    selectedId = null;
-    renderList();
-    renderNewForm();
+    selectedId = null; renderList(); renderNewForm();
   });
 
   /* ── RENDER DETAIL ── */
   function renderDetail(r) {
     var panel = document.getElementById('detail-panel');
-    var assigneeVal = r.assignee ? '@' + r.assignee : 'Unassigned';
+    var assigneeVal = r.assignee ? '@'+r.assignee : 'Unassigned';
 
-    var comments = (r.comments || []).length
-      ? r.comments.map(function(c){
+    var comments = (r.comments||[]).length
+      ? r.comments.map(c=>{
+          var wa = isWaSource(c.user);
           return '<div class="comment-item">' +
-            '<div class="av">' + ini(c.user) + '</div>' +
+            '<div class="av'+(wa?' wa':'')+'">'+ini(c.user)+'</div>' +
             '<div style="flex:1"><div style="display:flex;gap:8px;align-items:center;">' +
-              '<span class="c-user">@' + esc(c.user) + '</span>' +
-              '<span class="c-time">' + esc(c.time) + '</span></div>' +
-            '<div class="c-text">' + esc(c.message) + '</div></div></div>';
+              '<span class="c-user">'+esc(c.user)+'</span>' +
+              (wa?'<span class="badge b-wa" style="font-size:8px;">WA</span>':'') +
+              '<span class="c-time">'+esc(c.time)+'</span></div>' +
+            '<div class="c-text">'+esc(c.message)+'</div></div></div>';
         }).join('')
       : '<div style="color:var(--muted2);font-size:13px;padding:6px 0;">No comments yet.</div>';
 
@@ -857,164 +651,157 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       ? '<div class="dv-section">' +
           '<div class="dv-section-head"><div class="dv-section-title">Description</div></div>' +
           row(1, field('Details', r.description, 'prose')) +
-        '</div>'
-      : '';
+        '</div>' : '';
 
     panel.innerHTML =
       '<div class="detail-head">' +
         '<div class="detail-title-row">' +
-          '<div class="detail-title">[' + esc(r.incidentType || 'General') + '] ' + esc(r.title || r.report) + '</div>' +
-          '<div class="detail-id">#' + r.id + '</div>' +
+          '<div class="detail-title">['+esc(r.incidentType||'General')+'] '+esc(r.title||r.report)+'</div>' +
+          '<div class="detail-id">#'+r.id+'</div>' +
         '</div>' +
         '<div class="detail-badges">' +
-          '<span class="badge b-' + esc(r.severity) + '">' + esc(r.severity) + '</span>' +
-          '<span class="badge b-' + esc(r.status) + '">' + r.status.replace('_',' ') + '</span>' +
+          '<span class="badge b-'+esc(r.severity)+'">'+esc(r.severity)+'</span>' +
+          '<span class="badge b-'+esc(r.status)+'">'+r.status.replace('_',' ')+'</span>' +
           '<span class="badge b-wa">WhatsApp</span>' +
         '</div>' +
         '<div class="action-row" id="action-row"></div>' +
       '</div>' +
       '<div class="detail-tabs">' +
         '<button class="detail-tab on" data-tab="incident">Incident Details</button>' +
-        '<button class="detail-tab" data-tab="incoming">Incoming Messages (' + incomingMsgs.length + ')</button>' +
+        '<button class="detail-tab" data-tab="incoming">Incoming ('+incomingMsgs.length+')</button>' +
+        '<button class="detail-tab" data-tab="group">Group Numbers ('+groupNumbers.length+')</button>' +
       '</div>' +
       '<div class="dv-scroll" id="tab-incident">' +
-        // Report Info
         '<div class="dv-section">' +
           row(2,
-            field('Report Title', r.title || r.report) +
-            field('Report Type', r.incidentType || 'General')
+            '<div class="dv-field"><div class="dv-label">Incident Code</div><div class="dv-val code">'+esc(r.shortCode||'—')+'</div></div>' +
+            field('Report Type', r.incidentType||'General')
           ) +
-          row(2,
-            field('Report Date & Time', r.time, 'mono') +
-            field('Severity', r.severity)
-          ) +
-          row(2,
-            field('Reported By', r.reportedBy || '—', '', true) +
-            field('Nature of Incident', r.nature || 'Unspecified', '', true)
-          ) +
-          row(2,
-            field('Sector', r.sector || 'Unassigned') +
-            field('Assignee', assigneeVal)
-          ) +
-          row(2,
-            field('Created', r.time, 'mono') +
-            field('Last Updated', r.updatedAt || r.time, 'mono')
-          ) +
+          row(2, field('Report Title', r.title||r.report) + field('Severity', r.severity)) +
+          row(2, field('Reported By', r.reportedBy||'—','',true) + field('Nature of Incident', r.nature||'Unspecified','',true)) +
+          row(2, field('Sector', r.sector||'Unassigned') + field('Assignee', assigneeVal)) +
+          row(2, field('Created', r.time,'mono') + field('Last Updated', r.updatedAt||r.time,'mono')) +
         '</div>' +
-        // Location
         '<div class="dv-section">' +
           '<div class="dv-section-head"><div class="dv-section-title">Location</div></div>' +
           '<div class="dv-label" style="margin-bottom:6px;">Latitude</div>' +
-          row(3,
-            field('Lat Deg', r.latDeg || '—', 'mono') +
-            field('Lat Min', r.latMin || '—', 'mono') +
-            field('Lat Dir', r.latDir || 'N', 'mono')
-          ) +
-          row(1, field('Location Code', r.locationCode || '—', '', true)) +
+          row(3, field('Lat Deg',r.latDeg||'—','mono') + field('Lat Min',r.latMin||'—','mono') + field('Lat Dir',r.latDir||'N','mono')) +
+          row(1, field('Location Code',r.locationCode||'—','',true)) +
         '</div>' +
-        // Short Report
         '<div class="dv-section">' +
           '<div class="dv-section-head"><div class="dv-section-title">Short Report</div></div>' +
           row(1, field('Summary', r.report, 'prose', true)) +
         '</div>' +
         descHtml +
-        // Comments
         '<div class="dv-section">' +
-          '<div class="dv-section-head"><div class="dv-section-title">Comments (' + (r.comments || []).length + ')</div></div>' +
-          '<div class="comment-thread">' + comments + '</div>' +
+          '<div class="dv-section-head">' +
+            '<div class="dv-section-title">Comments ('+(r.comments||[]).length+')</div>' +
+            '<div style="font-size:10px;color:var(--muted2);font-family:Roboto Mono,monospace;">Reply on WA: <span style="color:var(--accent);">'+esc(r.shortCode)+' &lt;message&gt;</span></div>' +
+          '</div>' +
+          '<div class="comment-thread">'+comments+'</div>' +
         '</div>' +
       '</div>' +
-      '<div class="comment-bar">' +
-        '<textarea class="comment-input" id="c-input" placeholder="Add a comment… (Enter to send)"></textarea>' +
+      '<div class="comment-bar" id="comment-bar">' +
+        '<textarea class="comment-input" id="c-input" placeholder="Add a comment… (Enter to send, broadcasts to all WA numbers)"></textarea>' +
         '<button class="btn btn-primary" id="c-send">Send</button>' +
       '</div>';
 
-    // Build action buttons
+    // Action buttons
     var actionRow = document.getElementById('action-row');
-    if (r.status !== 'IN_PROGRESS') {
-      var b1 = document.createElement('button');
-      b1.className = 'btn btn-warn'; b1.textContent = 'In Progress';
-      b1.addEventListener('click', function(){ setStatus(r.id, 'IN_PROGRESS'); });
-      actionRow.appendChild(b1);
+    if (r.status!=='IN_PROGRESS') {
+      var b1=document.createElement('button'); b1.className='btn btn-warn'; b1.textContent='In Progress';
+      b1.addEventListener('click',()=>setStatus(r.id,'IN_PROGRESS')); actionRow.appendChild(b1);
     }
-    if (r.status !== 'RESOLVED') {
-      var b2 = document.createElement('button');
-      b2.className = 'btn btn-success'; b2.textContent = 'Resolve';
-      b2.addEventListener('click', function(){ setStatus(r.id, 'RESOLVED'); });
-      actionRow.appendChild(b2);
+    if (r.status!=='RESOLVED') {
+      var b2=document.createElement('button'); b2.className='btn btn-success'; b2.textContent='Resolve';
+      b2.addEventListener('click',()=>setStatus(r.id,'RESOLVED')); actionRow.appendChild(b2);
     }
-    if (r.status !== 'OPEN') {
-      var b3 = document.createElement('button');
-      b3.className = 'btn btn-danger'; b3.textContent = 'Reopen';
-      b3.addEventListener('click', function(){ setStatus(r.id, 'OPEN'); });
-      actionRow.appendChild(b3);
+    if (r.status!=='OPEN') {
+      var b3=document.createElement('button'); b3.className='btn btn-danger'; b3.textContent='Reopen';
+      b3.addEventListener('click',()=>setStatus(r.id,'OPEN')); actionRow.appendChild(b3);
     }
 
-    document.getElementById('c-send').addEventListener('click', function(){ addComment(r.id); });
-    document.getElementById('c-input').addEventListener('keydown', function(e){
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); addComment(r.id); }
+    document.getElementById('c-send').addEventListener('click',()=>addComment(r.id));
+    document.getElementById('c-input').addEventListener('keydown',function(e){
+      if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();addComment(r.id);}
     });
 
     // Tab switching
-    panel.querySelectorAll('.detail-tab').forEach(function(tab){
+    panel.querySelectorAll('.detail-tab').forEach(tab=>{
       tab.addEventListener('click', function(){
-        panel.querySelectorAll('.detail-tab').forEach(function(t){ t.classList.remove('on'); });
+        panel.querySelectorAll('.detail-tab').forEach(t=>t.classList.remove('on'));
         tab.classList.add('on');
         activeTab = tab.dataset.tab;
         var incTab = document.getElementById('tab-incident');
-        var cbar = panel.querySelector('.comment-bar');
-        if (activeTab === 'incident') {
-          if (incTab) incTab.style.display = 'flex';
-          if (cbar) cbar.style.display = 'flex';
-          var existingLog = document.getElementById('tab-incoming');
-          if (existingLog) existingLog.remove();
+        var cbar = document.getElementById('comment-bar');
+        var extra = document.getElementById('tab-extra');
+        if (extra) extra.remove();
+        if (activeTab==='incident') {
+          if(incTab) incTab.style.display='flex';
+          if(cbar) cbar.style.display='flex';
         } else {
-          if (incTab) incTab.style.display = 'none';
-          if (cbar) cbar.style.display = 'none';
-          renderIncomingTab(panel);
+          if(incTab) incTab.style.display='none';
+          if(cbar) cbar.style.display='none';
+          if(activeTab==='incoming') renderIncomingTab(panel);
+          else if(activeTab==='group') renderGroupTab(panel);
         }
       });
     });
   }
 
-  /* ── INCOMING MESSAGES TAB ── */
+  /* ── INCOMING TAB ── */
   function renderIncomingTab(panel) {
-    panel = panel || document.getElementById('detail-panel');
-    var existing = document.getElementById('tab-incoming');
-    if (existing) existing.remove();
-
     var div = document.createElement('div');
-    div.id = 'tab-incoming';
-    div.className = 'wa-log-panel';
-
+    div.id='tab-extra'; div.className='wa-log-panel';
     if (!incomingMsgs.length) {
-      div.innerHTML = '<div class="empty" style="padding:40px 0;"><div style="font-size:36px;opacity:.2;">📭</div><div style="font-size:14px;font-weight:600;">No incoming messages</div><div style="font-size:12px;margin-top:4px;">Messages from WhatsApp will appear here</div></div>';
+      div.innerHTML='<div class="empty" style="padding:40px 0;"><div style="font-size:36px;opacity:.2;">📭</div><div style="font-size:14px;font-weight:600;">No incoming messages yet</div></div>';
     } else {
-      div.innerHTML = incomingMsgs.map(function(m){
+      div.innerHTML = incomingMsgs.map(m=>{
+        var incMatch = (m.text||'').trim().match(/^(INC-[A-Z0-9]{4})/i);
+        var tag = incMatch ? '<span class="badge b-wa" style="margin-left:6px;">'+esc(incMatch[1].toUpperCase())+'</span>' : '';
         return '<div class="wa-msg">' +
-          '<div class="av" style="background:#0a2016;color:#25d366;">📨</div>' +
+          '<div style="font-size:20px;flex-shrink:0;">📨</div>' +
           '<div style="flex:1">' +
-            '<div class="wa-from">+' + esc(m.from) + '</div>' +
-            '<div class="wa-text">' + esc(m.text) + '</div>' +
-            '<div class="wa-time">' + esc(m.time) + '</div>' +
-          '</div>' +
-        '</div>';
+            '<div style="display:flex;align-items:center;gap:4px;">' +
+              '<span class="wa-from">+'+esc(m.from)+'</span>'+tag+
+            '</div>' +
+            '<div class="wa-text">'+esc(m.text)+'</div>' +
+            '<div class="wa-time">'+esc(m.time)+'</div>' +
+          '</div></div>';
       }).join('');
     }
+    panel.appendChild(div);
+  }
 
-    var cbar = panel.querySelector('.comment-bar');
-    if (cbar) {
-      panel.insertBefore(div, cbar);
-    } else {
-      panel.appendChild(div);
-    }
+  /* ── GROUP NUMBERS TAB ── */
+  function renderGroupTab(panel) {
+    var div = document.createElement('div');
+    div.id='tab-extra'; div.className='group-panel';
+    var items = groupNumbers.length
+      ? groupNumbers.map(n=>'<div class="num-item"><span class="num-val">+'+esc(n)+'</span><span class="badge b-wa">Active</span></div>').join('')
+      : '<div style="color:var(--muted2);font-size:13px;">No numbers configured.</div>';
+    div.innerHTML =
+      '<div class="dv-section">' +
+        '<div class="dv-section-head"><div class="dv-section-title">Broadcast Group</div></div>' +
+        items +
+      '</div>' +
+      '<div class="num-hint">' +
+        '📋 To manage numbers, update the <code>GROUP_NUMBERS</code> environment variable on Render and redeploy.<br><br>' +
+        'Format: <code>6591234567,6598765432,6581234567</code><br><br>' +
+        '💬 Anyone in this list can reply to incidents using:<br>' +
+        '<code>INC-XXXX &lt;your message&gt;</code> — adds a comment<br>' +
+        '<code>INC-XXXX RESOLVE</code> — marks resolved<br>' +
+        '<code>INC-XXXX PROGRESS</code> — marks in progress<br>' +
+        '<code>INC-XXXX OPEN</code> — reopens incident' +
+      '</div>';
+    panel.appendChild(div);
   }
 
   /* ── ACTIONS ── */
   function setStatus(id, status) {
-    fetch('/api/reports/' + id + '/status', {
+    fetch('/api/reports/'+id+'/status', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ status: status, user: 'dashboard' })
+      body: JSON.stringify({status, user:'dashboard'})
     }).then(load);
   }
 
@@ -1022,10 +809,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     var input = document.getElementById('c-input');
     var msg = input.value.trim();
     if (!msg) return;
-    fetch('/api/reports/' + id + '/comment', {
+    fetch('/api/reports/'+id+'/comment', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ message: msg, user: 'dashboard' })
-    }).then(function(){ input.value = ''; load(); });
+      body: JSON.stringify({message:msg, user:'dashboard'})
+    }).then(()=>{ input.value=''; load(); });
   }
 
   /* ── NEW INCIDENT FORM ── */
@@ -1033,14 +820,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     var panel = document.getElementById('detail-panel');
     panel.innerHTML =
       '<div class="detail-head">' +
-        '<div class="detail-title-row">' +
-          '<div class="detail-title">New Incident Report</div>' +
-        '</div>' +
-        '<div class="detail-badges"><span class="badge b-wa">WhatsApp</span></div>' +
-        '<div class="action-row" id="action-row"></div>' +
+        '<div class="detail-title-row"><div class="detail-title">New Incident Report</div></div>' +
+        '<div class="detail-badges"><span class="badge b-wa">WhatsApp Broadcast</span></div>' +
+        '<div class="action-row"></div>' +
       '</div>' +
       '<div class="dv-scroll">' +
-        // Report Info
         '<div class="dv-section">' +
           '<div class="dv-row col2">' +
             '<div class="dv-field"><div class="dv-label req">Report Title</div><input class="dv-input" id="nf-title" placeholder="Short descriptive title"></div>' +
@@ -1063,7 +847,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             '<div class="dv-field"><div class="dv-label">Assignee</div><input class="dv-input" id="nf-assignee" placeholder="@username"></div>' +
           '</div>' +
         '</div>' +
-        // Location
         '<div class="dv-section">' +
           '<div class="dv-section-head"><div class="dv-section-title">Location</div></div>' +
           '<div class="dv-label" style="margin-bottom:6px;">Latitude</div>' +
@@ -1078,11 +861,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             '<div class="dv-field"><div class="dv-label req">Location Code</div><input class="dv-input" id="nf-loccode" placeholder="e.g. ACGP"></div>' +
           '</div>' +
         '</div>' +
-        // Report Content
         '<div class="dv-section">' +
           '<div class="dv-section-head"><div class="dv-section-title">Report Content</div></div>' +
           '<div class="dv-row col1">' +
-            '<div class="dv-field"><div class="dv-label req">Short Report (sent to WhatsApp)</div><input class="dv-input" id="nf-msg" placeholder="One-line summary"></div>' +
+            '<div class="dv-field"><div class="dv-label req">Short Report (broadcast to all WA numbers)</div><input class="dv-input" id="nf-msg" placeholder="One-line summary"></div>' +
           '</div>' +
           '<div class="dv-row col1">' +
             '<div class="dv-field"><div class="dv-label">Description</div><textarea class="dv-input" id="nf-desc" style="min-height:80px;resize:vertical;" placeholder="What happened? Impact, context…"></textarea></div>' +
@@ -1091,19 +873,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       '</div>' +
       '<div class="comment-bar">' +
         '<button class="btn btn-ghost" id="nf-cancel">Cancel</button>' +
-        '<button class="btn btn-primary" id="nf-submit">Create Incident</button>' +
+        '<button class="btn btn-primary" id="nf-submit">Create & Broadcast</button>' +
       '</div>';
 
     document.getElementById('nf-submit').addEventListener('click', submitReport);
     document.getElementById('nf-cancel').addEventListener('click', function(){
-      selectedId = null;
-      renderList();
+      selectedId=null; renderList();
       document.getElementById('detail-panel').innerHTML =
-        '<div class="empty">' +
-          '<div style="font-size:40px;opacity:.2;">⌖</div>' +
-          '<div style="font-size:14px;font-weight:600;">Select an incident</div>' +
-          '<div style="font-size:12px;margin-top:2px;">or create one with + New Incident</div>' +
-        '</div>';
+        '<div class="empty"><div style="font-size:40px;opacity:.2;">⌖</div>' +
+        '<div style="font-size:14px;font-weight:600;">Select an incident</div>' +
+        '<div style="font-size:12px;margin-top:2px;">or create one with + New Incident</div></div>';
     });
     document.getElementById('nf-title').focus();
   }
@@ -1112,9 +891,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     var title = document.getElementById('nf-title').value.trim();
     if (!title) { document.getElementById('nf-title').focus(); return; }
     var body = {
-      title: title,
-      incidentType: document.getElementById('nf-type').value.trim() || 'General',
-      nature: document.getElementById('nf-nature').value.trim() || 'Unspecified',
+      title, user:'dashboard',
+      incidentType: document.getElementById('nf-type').value.trim()||'General',
+      nature: document.getElementById('nf-nature').value.trim()||'Unspecified',
       severity: document.getElementById('nf-sev').value,
       priority: document.getElementById('nf-pri').value,
       sector: document.getElementById('nf-sector').value.trim(),
@@ -1122,15 +901,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       latMin: document.getElementById('nf-latmin').value.trim(),
       latDir: document.getElementById('nf-latdir').value,
       locationCode: document.getElementById('nf-loccode').value.trim(),
-      reportedBy: document.getElementById('nf-reportedby').value.trim() || 'Dashboard Operator',
+      reportedBy: document.getElementById('nf-reportedby').value.trim()||'Dashboard Operator',
       assignee: document.getElementById('nf-assignee').value.trim(),
       description: document.getElementById('nf-desc').value.trim(),
-      message: document.getElementById('nf-msg').value.trim() || title,
-      user: 'dashboard'
+      message: document.getElementById('nf-msg').value.trim()||title
     };
     fetch('/api/report', {
-      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
-    }).then(function(res){ return res.json(); }).then(function(data){
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+    }).then(r=>r.json()).then(data=>{
       load();
       selectedId = String(data.report.id);
       activeTab = 'incident';
@@ -1143,7 +921,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   setInterval(load, 8000);
 })();
 </script>
-
 </body>
 </html>`;
 
