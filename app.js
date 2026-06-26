@@ -1069,7 +1069,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           '<div class="dv-label" style="margin-bottom:6px;">Latitude</div>' +
           '<div class="dv-row col3">' +
             '<div class="dv-field"><div class="dv-label">Lat Deg</div><input class="dv-input mono" id="nf-latdeg" type="number" placeholder="°"></div>' +
-            '<div class="dv-field"><div class="dv-label">Lat Min</div><input class="dv-input mono" id="nf-latmin" type="number" placeholder="\'"></div>' +
+            '<div class="dv-field"><div class="dv-label">Lat Min</div><input class="dv-input mono" id="nf-latmin" type="number" placeholder="\"></div>' +
             '<div class="dv-field"><div class="dv-label">Lat Dir</div>' +
               '<select class="dv-input mono" id="nf-latdir"><option value="N">N</option><option value="S">S</option><option value="E">E</option><option value="W">W</option></select>' +
             '</div>' +
