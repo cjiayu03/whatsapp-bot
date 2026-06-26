@@ -111,6 +111,103 @@ async function broadcast(message, excludeNumber = null) {
 async function handleIncomingCommand(from, text) {
   const upper = text.trim().toUpperCase();
 
+  // ── TEMPLATE REQUEST ──────────────────────────────────────────────────────
+  if (upper === 'INC-TEMPLATE' || upper === 'TEMPLATE' || upper === '/TEMPLATE') {
+    await sendWhatsAppMessage(from,
+      `📝 *Incident Report Template*\n\n` +
+      `Copy, fill in, and send:\n\n` +
+      `INC-NEW\n` +
+      `Title: \n` +
+      `Type: General\n` +
+      `Nature: \n` +
+      `Severity: medium\n` +
+      `Sector: \n` +
+      `Lat Deg: \n` +
+      `Lat Min: \n` +
+      `Lat Dir: N\n` +
+      `Loc Code: \n` +
+      `Reported By: \n` +
+      `Description: \n\n` +
+      `Severity options: low / medium / critical`
+    );
+    return true;
+  }
+
+  // ── CREATE NEW INCIDENT ───────────────────────────────────────────────────
+  if (upper.startsWith('INC-NEW')) {
+    const get = (re, fb = '') => {
+      const m = text.match(re);
+      return m && m[1] ? m[1].trim() : fb;
+    };
+
+    const title = get(/^Title:\s*(.+)$/im, '');
+    if (!title) {
+      await sendWhatsAppMessage(from,
+        `❌ *Title is required.*\n\nSend *TEMPLATE* to get the report template.`
+      );
+      return true;
+    }
+
+    const incidentType  = get(/^Type:\s*(.+)$/im, 'General');
+    const nature        = get(/^Nature:\s*(.+)$/im, 'Unspecified');
+    const severityRaw   = get(/^Severity:\s*(.+)$/im, 'medium').toLowerCase();
+    const sector        = get(/^Sector:\s*(.+)$/im, 'Unassigned');
+    const latDeg        = get(/^Lat Deg:\s*(\d*)$/im, '');
+    const latMin        = get(/^Lat Min:\s*(\d*)$/im, '');
+    const latDir        = get(/^Lat Dir:\s*([NSEWnsew])$/im, 'N').toUpperCase();
+    const locationCode  = get(/^Loc Code:\s*(.+)$/im, '');
+    const reportedBy    = get(/^Reported By:\s*(.+)$/im, `+${from}`);
+    const description   = get(/^Description:\s*([\s\S]+)$/im, '');
+    const severity      = VALID_SEVERITIES.includes(severityRaw) ? severityRaw : 'medium';
+
+    const shortCode = ensureUniqueCode();
+    const report = {
+      id: Date.now(), shortCode,
+      user: `+${from}`, severity,
+      report: title, title: title.slice(0, 60),
+      description, assignee: '', priority: severity === 'critical' ? 'high' : 'normal',
+      status: 'OPEN', source: 'whatsapp',
+      time: now(), updatedAt: now(), comments: [],
+      incidentType, nature, sector,
+      latDeg, latMin, latDir, locationCode,
+      reportedBy, attachment: ''
+    };
+
+    reports.unshift(report);
+
+    const locStr = formatLocation(report) !== 'N/A' ? `\n📍 ${formatLocation(report)}` : '';
+    const descStr = description ? `\n\n📋 ${description}` : '';
+
+    // Confirm to sender
+    await sendWhatsAppMessage(from,
+      `✅ *Incident Created*\n\n` +
+      `🔖 Code: *${shortCode}*\n` +
+      `Title: ${title}\n` +
+      `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n\n` +
+      `Live on the dashboard.\n\n` +
+      `↩️ Use *${shortCode} <message>* to add updates`
+    );
+
+    // Broadcast to group
+    await broadcast(
+      `🚨 *NEW INCIDENT [${incidentType.toUpperCase()}]*\n\n` +
+      `🔖 Code: *${shortCode}*\n` +
+      `Title: ${title}\n` +
+      `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n` +
+      `Nature: ${nature}\n` +
+      `Sector: ${sector}\n` +
+      `Reporter: ${reportedBy}\n` +
+      `Status: 🆕 OPEN` +
+      locStr + descStr +
+      `\n\n↩️ Reply: *${shortCode} <message>* to comment\n` +
+      `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`,
+      from  // exclude sender since they already got the confirm
+    );
+
+    return true;
+  }
+
+  // ── EXISTING INCIDENT COMMANDS ────────────────────────────────────────────
   // Check if it starts with INC-
   const incMatch = text.trim().match(/^(INC-[A-Z0-9]{4})\s*(.*)/i);
   if (!incMatch) return false;
@@ -787,12 +884,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       '</div>' +
       '<div class="num-hint">' +
         '📋 To manage numbers, update the <code>GROUP_NUMBERS</code> environment variable on Render and redeploy.<br><br>' +
-        'Format: <code>6591234567,6598765432,6581234567</code><br><br>' +
-        '💬 Anyone in this list can reply to incidents using:<br>' +
-        '<code>INC-XXXX &lt;your message&gt;</code> — adds a comment<br>' +
-        '<code>INC-XXXX RESOLVE</code> — marks resolved<br>' +
-        '<code>INC-XXXX PROGRESS</code> — marks in progress<br>' +
-        '<code>INC-XXXX OPEN</code> — reopens incident' +
+        'Format: <code>6591234567,6598765432,6581234567</code>' +
+      '</div>' +
+      '<div class="num-hint">' +
+        '💬 <strong style="color:var(--text)">WA Commands (send to your Business number):</strong><br><br>' +
+        '<code>TEMPLATE</code> — get the incident report template<br><br>' +
+        '<code>INC-NEW</code> — create a new incident (send with filled template)<br><br>' +
+        '<code>INC-XXXX &lt;message&gt;</code> — add a comment<br>' +
+        '<code>INC-XXXX RESOLVE</code> — mark resolved<br>' +
+        '<code>INC-XXXX PROGRESS</code> — mark in progress<br>' +
+        '<code>INC-XXXX OPEN</code> — reopen incident<br>' +
+        '<code>INC-XXXX</code> — get incident summary' +
       '</div>';
     panel.appendChild(div);
   }
