@@ -298,22 +298,16 @@ app.post('/', async (req, res) => {
   const from = message.from;
   const text = message.text?.body || '';
 
-  // Log incoming
-  incomingMessages.unshift({ time: timestamp, from, text: text || '[non-text]' });
-  incomingMessages = incomingMessages.slice(0, 100);
-
   if (!text) return;
 
-  // Try to parse as incident command
-  const handled = await handleIncomingCommand(from, text);
-
-  // If not a command and sender is in the group, relay to others
-  if (!handled) {
-    const groupNumbers = getGroupNumbers();
-    if (groupNumbers.includes(from)) {
-      await broadcast(`📨 *+${from}:*\n${text}`, from);
-    }
+  // Only log messages that are incident-relevant
+  const isRelevant = /^(INC-|TEMPLATE|\/TEMPLATE)/i.test(text.trim());
+  if (isRelevant) {
+    incomingMessages.unshift({ time: timestamp, from, text });
+    incomingMessages = incomingMessages.slice(0, 100);
   }
+
+  await handleIncomingCommand(from, text);
 });
 
 /* =========================
