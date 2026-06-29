@@ -41,6 +41,7 @@ function resolveName(number) {
 ========================= */
 let reports = [];
 let incomingMessages = [];
+const knownSenders = new Set(); // numbers that have messaged us — free-form allowed
 
 const VALID_SEVERITIES = ['low', 'medium', 'critical'];
 const VALID_STATUSES = ['OPEN', 'IN_PROGRESS', 'RESOLVED'];
@@ -165,18 +166,31 @@ function buildTemplateParams(report) {
    on 131047 (outside 24hr window)
 ========================= */
 async function sendWhatsAppMessage(toNumber, message, report = null) {
+  const isKnown = knownSenders.has(toNumber);
+
+  // If number has never messaged us, skip free-form (Meta silently drops it)
+  // and go straight to template if we have a report
+  if (!isKnown && report) {
+    console.log(`📋 ${toNumber} unknown sender — using template directly`);
+    try {
+      await sendTemplate(toNumber, buildTemplateParams(report));
+      console.log(`✅ WA template sent to ${toNumber}`);
+    } catch (tplErr) {
+      console.error(`❌ Template failed for ${toNumber}:`, JSON.stringify(tplErr.response?.data || tplErr.message));
+    }
+    return;
+  }
+
+  // Known sender or no report — try free-form first
   try {
     await sendFreeForm(toNumber, message);
     console.log(`✅ WA free-form sent to ${toNumber}`);
   } catch (err) {
     const errCode = err.response?.data?.error?.code;
     const subcode = err.response?.data?.error?.error_subcode;
-    // Log the exact error so it's visible in Render logs
     console.warn(`⚠️ WA free-form failed for ${toNumber} [code:${errCode} sub:${subcode}]:`, JSON.stringify(err.response?.data || err.message));
 
     if (report) {
-      // Fall back to template on ANY send failure (not just 131047)
-      // This covers: 131047 (24hr window), 131026 (undeliverable), and any other block
       console.log(`⏰ Falling back to template for ${toNumber}`);
       try {
         await sendTemplate(toNumber, buildTemplateParams(report));
@@ -185,7 +199,7 @@ async function sendWhatsAppMessage(toNumber, message, report = null) {
         console.error(`❌ Template also failed for ${toNumber} [code:${tplErr.response?.data?.error?.code}]:`, JSON.stringify(tplErr.response?.data || tplErr.message));
       }
     } else {
-      console.error(`❌ WA error to ${toNumber} (no report for template fallback):`, JSON.stringify(err.response?.data || err.message));
+      console.error(`❌ WA error to ${toNumber} (no report — cannot use template):`, JSON.stringify(err.response?.data || err.message));
     }
   }
 }
@@ -395,6 +409,9 @@ app.post('/', async (req, res) => {
 
   const from = message.from;
   const text = message.text?.body || '';
+
+  // Mark this number as having messaged us — opens free-form window
+  knownSenders.add(from);
 
   if (!text) return;
 
