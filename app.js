@@ -19,6 +19,24 @@ function getGroupNumbers() {
 }
 
 /* =========================
+   NUMBER -> NAME MAPPING
+   env: NUMBER_NAMES=6591234567:John,6598765432:Sarah
+========================= */
+function getNameMap() {
+  const map = {};
+  (process.env.NUMBER_NAMES || '').split(',').forEach(pair => {
+    const [num, ...rest] = pair.trim().split(':');
+    if (num && rest.length) map[num.trim()] = rest.join(':').trim();
+  });
+  return map;
+}
+function resolveName(number) {
+  const map = getNameMap();
+  const clean = String(number).replace(/^\+/, '');
+  return map[clean] || `+${clean}`;
+}
+
+/* =========================
    MEMORY STORE
 ========================= */
 let reports = [];
@@ -31,21 +49,20 @@ function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 function severityEmoji(s) {
-  return { low: '🟡', medium: '🟠', critical: '🔴' }[s] || '⚪';
+  return { low: '\u{1F7E1}', medium: '\u{1F7E0}', critical: '\u{1F534}' }[s] || '\u26AA';
 }
 function statusEmoji(s) {
-  return { OPEN: '🆕', IN_PROGRESS: '🔧', RESOLVED: '✅' }[s] || '❓';
+  return { OPEN: '\u{1F195}', IN_PROGRESS: '\u{1F527}', RESOLVED: '\u2705' }[s] || '\u2753';
 }
 function formatLocation(r) {
   if (!r.latDeg && !r.locationCode) return 'N/A';
-  const latStr = r.latDeg ? `${r.latDeg}°${r.latMin || '00'}'${r.latDir || 'N'}` : '';
+  const latStr = r.latDeg ? `${r.latDeg}\u00B0${r.latMin || '00'}'${r.latDir || 'N'}` : '';
   const codeStr = r.locationCode ? `[Code: ${r.locationCode}]` : '';
   return `${latStr} ${codeStr}`.trim();
 }
 
 /* =========================
    SHORT CODE GENERATOR
-   e.g. INC-A3F
 ========================= */
 function generateShortCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -66,39 +83,114 @@ function ensureUniqueCode() {
 }
 
 /* =========================
-   WHATSAPP SEND (single)
+   WHATSAPP SEND - FREE FORM
 ========================= */
-async function sendWhatsAppMessage(toNumber, message) {
-  try {
-    const response = await axios.post(
-      `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to: toNumber,
-        recipient_type: "individual",
-        type: "text",
-        text: { body: message, preview_url: false }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          "Content-Type": "application/json"
-        }
+async function sendFreeForm(toNumber, message) {
+  const response = await axios.post(
+    `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to: toNumber,
+      recipient_type: "individual",
+      type: "text",
+      text: { body: message, preview_url: false }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
       }
-    );
-    console.log(`✅ WA sent to ${toNumber}`);
-    return response.data;
+    }
+  );
+  return response.data;
+}
+
+/* =========================
+   WHATSAPP SEND - TEMPLATE
+   Template: incidents (en)
+   12 body parameters
+========================= */
+async function sendTemplate(toNumber, components) {
+  const response = await axios.post(
+    `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: "whatsapp",
+      to: toNumber,
+      type: "template",
+      template: {
+        name: "incidents",
+        language: { code: "en" },
+        components: [
+          {
+            type: "body",
+            parameters: components.map(v => ({ type: "text", text: String(v || '-') }))
+          }
+        ]
+      }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  return response.data;
+}
+
+/* =========================
+   BUILD TEMPLATE PARAMS
+   Maps to 12 placeholders
+========================= */
+function buildTemplateParams(report) {
+  return [
+    report.incidentType || 'General',
+    report.shortCode || '-',
+    report.title || report.report || '-',
+    `${severityEmoji(report.severity)} ${(report.severity || '').toUpperCase()}`,
+    (report.priority || 'normal').toUpperCase(),
+    report.nature || 'Unspecified',
+    report.sector || 'Unassigned',
+    report.reportedBy || '-',
+    report.status || 'OPEN',
+    report.report || report.title || '-',
+    report.shortCode || '-',
+    report.shortCode || '-',
+  ];
+}
+
+/* =========================
+   WHATSAPP SEND (single)
+   Auto-falls back to template
+   on 131047 (outside 24hr window)
+========================= */
+async function sendWhatsAppMessage(toNumber, message, report = null) {
+  try {
+    await sendFreeForm(toNumber, message);
+    console.log(`\u2705 WA free-form sent to ${toNumber}`);
   } catch (err) {
-    console.error(`❌ WA error to ${toNumber}:`, err.response?.data || err.message);
+    const errCode = err.response?.data?.error?.code;
+    const subcode = err.response?.data?.error?.error_subcode;
+    if ((errCode === 131047 || errCode === 131026 || subcode === 131047) && report) {
+      console.log(`\u23F0 24hr window expired for ${toNumber} - falling back to template`);
+      try {
+        await sendTemplate(toNumber, buildTemplateParams(report));
+        console.log(`\u2705 WA template sent to ${toNumber}`);
+      } catch (tplErr) {
+        console.error(`\u274C Template failed for ${toNumber}:`, tplErr.response?.data || tplErr.message);
+      }
+    } else {
+      console.error(`\u274C WA error to ${toNumber}:`, err.response?.data || err.message);
+    }
   }
 }
 
 /* =========================
    BROADCAST (all numbers)
 ========================= */
-async function broadcast(message, excludeNumber = null) {
+async function broadcast(message, excludeNumber = null, report = null) {
   const numbers = getGroupNumbers().filter(n => n !== excludeNumber);
-  await Promise.all(numbers.map(n => sendWhatsAppMessage(n, message)));
+  await Promise.all(numbers.map(n => sendWhatsAppMessage(n, message, report)));
 }
 
 /* =========================
@@ -201,7 +293,7 @@ async function handleIncomingCommand(from, text) {
       locStr + descStr +
       `\n\n↩️ Reply: *${shortCode} <message>* to comment\n` +
       `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`,
-      from  // exclude sender since they already got the confirm
+      from, report
     );
 
     return true;
@@ -228,12 +320,13 @@ async function handleIncomingCommand(from, text) {
     const old = report.status;
     report.status = newStatus;
     report.updatedAt = now();
+    const updaterName = resolveName(from);
     const msg =
       `${statusEmoji(newStatus)} *Status Update*\n\n` +
       `${code} — ${report.title}\n` +
       `${old} → ${newStatus}\n` +
-      `By: +${from}`;
-    await broadcast(msg);
+      `By: ${updaterName}`;
+    await broadcast(msg, null, report);
     return true;
   }
 
@@ -245,9 +338,9 @@ async function handleIncomingCommand(from, text) {
     const msg =
       `💬 *Comment on ${code}*\n` +
       `"${report.title}"\n\n` +
-      `+${from}: ${rest}\n\n` +
+      `${resolveName(from)}: ${rest}\n\n` +
       `↩️ Reply: ${code} <message>`;
-    await broadcast(msg, from);
+    await broadcast(msg, from, report);
     // Confirm to sender
     await sendWhatsAppMessage(from, `✅ Comment added to ${code}`);
     return true;
@@ -300,11 +393,15 @@ app.post('/', async (req, res) => {
 
   if (!text) return;
 
-  // Only log messages that are incident-relevant
-  const isRelevant = /^(INC-|TEMPLATE|\/TEMPLATE)/i.test(text.trim());
-  if (isRelevant) {
-    incomingMessages.unshift({ time: timestamp, from, text });
-    incomingMessages = incomingMessages.slice(0, 100);
+  // Only log messages that reference an existing incident (INC-XXXX replies only)
+  const codeMatch = text.trim().match(/^(INC-[A-Z0-9]{4})\s*/i);
+  if (codeMatch) {
+    const code = codeMatch[1].toUpperCase();
+    const matchedReport = reports.find(r => r.shortCode === code);
+    if (matchedReport) {
+      incomingMessages.unshift({ time: timestamp, from, text, incidentCode: code, incidentId: matchedReport.id });
+      incomingMessages = incomingMessages.slice(0, 100);
+    }
   }
 
   await handleIncomingCommand(from, text);
@@ -354,7 +451,8 @@ app.post('/api/report', async (req, res) => {
     locStr + assigneeStr +
     `\n\n💬 ${message}` + descStr +
     `\n\n↩️ Reply: *${shortCode} <message>* to comment\n` +
-    `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`
+    `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`,
+    null, report
   );
 
   res.json({ success: true, report });
@@ -389,7 +487,8 @@ app.post('/api/reports/:id/status', async (req, res) => {
     `${report.shortCode} — ${report.title}\n` +
     `${old} → ${status}\n` +
     `By: ${user} (dashboard)\n\n` +
-    `↩️ Reply: *${report.shortCode} <message>* to comment`
+    `↩️ Reply: *${report.shortCode} <message>* to comment`,
+    null, report
   );
   res.json({ success: true, report });
 });
@@ -409,7 +508,8 @@ app.post('/api/reports/:id/comment', async (req, res) => {
     `💬 *Comment on ${report.shortCode}*\n` +
     `"${report.title}"\n\n` +
     `${user} (dashboard): ${message}\n\n` +
-    `↩️ Reply: *${report.shortCode} <message>* to respond`
+    `↩️ Reply: *${report.shortCode} <message>* to respond`,
+    null, report
   );
   res.json({ success: true, comment });
 });
@@ -841,20 +941,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   /* ── INCOMING TAB ── */
-  function renderIncomingTab(panel) {
+  function renderIncomingTab(panel, filterIncidentId) {
     var div = document.createElement('div');
     div.id='tab-extra'; div.className='wa-log-panel';
-    if (!incomingMsgs.length) {
-      div.innerHTML='<div class="empty" style="padding:40px 0;"><div style="font-size:36px;opacity:.2;">📭</div><div style="font-size:14px;font-weight:600;">No incoming messages yet</div></div>';
+    // Filter to only messages for this specific incident
+    var filtered = filterIncidentId
+      ? incomingMsgs.filter(m => String(m.incidentId) === String(filterIncidentId))
+      : incomingMsgs;
+    if (!filtered.length) {
+      div.innerHTML='<div class="empty" style="padding:40px 0;"><div style="font-size:36px;opacity:.2;">📭</div><div style="font-size:14px;font-weight:600;">No incoming messages for this incident</div><div style="font-size:12px;margin-top:4px;">WA replies using the incident code will appear here</div></div>';
     } else {
-      div.innerHTML = incomingMsgs.map(m=>{
-        var incMatch = (m.text||'').trim().match(/^(INC-[A-Z0-9]{4})/i);
-        var tag = incMatch ? '<span class="badge b-wa" style="margin-left:6px;">'+esc(incMatch[1].toUpperCase())+'</span>' : '';
+      div.innerHTML = filtered.map(m=>{
         return '<div class="wa-msg">' +
           '<div style="font-size:20px;flex-shrink:0;">📨</div>' +
           '<div style="flex:1">' +
-            '<div style="display:flex;align-items:center;gap:4px;">' +
-              '<span class="wa-from">+'+esc(m.from)+'</span>'+tag+
+            '<div style="display:flex;align-items:center;gap:6px;">' +
+              '<span class="wa-from">+'+esc(m.from)+'</span>' +
+              '<span class="badge b-wa">'+esc(m.incidentCode)+'</span>' +
             '</div>' +
             '<div class="wa-text">'+esc(m.text)+'</div>' +
             '<div class="wa-time">'+esc(m.time)+'</div>' +
@@ -948,7 +1051,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           '<div class="dv-label" style="margin-bottom:6px;">Latitude</div>' +
           '<div class="dv-row col3">' +
             '<div class="dv-field"><div class="dv-label">Lat Deg</div><input class="dv-input mono" id="nf-latdeg" type="number" placeholder="°"></div>' +
-            '<div class="dv-field"><div class="dv-label">Lat Min</div><input class="dv-input mono" id="nf-latmin" type="number" placeholder="\"></div>' +
+            '<div class="dv-field"><div class="dv-label">Lat Min</div><input class="dv-input mono" id="nf-latmin" type="number" placeholder="\'"></div>' +
             '<div class="dv-field"><div class="dv-label">Lat Dir</div>' +
               '<select class="dv-input mono" id="nf-latdir"><option value="N">N</option><option value="S">S</option><option value="E">E</option><option value="W">W</option></select>' +
             '</div>' +
