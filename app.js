@@ -167,20 +167,25 @@ function buildTemplateParams(report) {
 async function sendWhatsAppMessage(toNumber, message, report = null) {
   try {
     await sendFreeForm(toNumber, message);
-    console.log(`\u2705 WA free-form sent to ${toNumber}`);
+    console.log(`✅ WA free-form sent to ${toNumber}`);
   } catch (err) {
     const errCode = err.response?.data?.error?.code;
     const subcode = err.response?.data?.error?.error_subcode;
-    if ((errCode === 131047 || errCode === 131026 || subcode === 131047) && report) {
-      console.log(`\u23F0 24hr window expired for ${toNumber} - falling back to template`);
+    // Log the exact error so it's visible in Render logs
+    console.warn(`⚠️ WA free-form failed for ${toNumber} [code:${errCode} sub:${subcode}]:`, JSON.stringify(err.response?.data || err.message));
+
+    if (report) {
+      // Fall back to template on ANY send failure (not just 131047)
+      // This covers: 131047 (24hr window), 131026 (undeliverable), and any other block
+      console.log(`⏰ Falling back to template for ${toNumber}`);
       try {
         await sendTemplate(toNumber, buildTemplateParams(report));
-        console.log(`\u2705 WA template sent to ${toNumber}`);
+        console.log(`✅ WA template sent to ${toNumber}`);
       } catch (tplErr) {
-        console.error(`\u274C Template failed for ${toNumber}:`, tplErr.response?.data || tplErr.message);
+        console.error(`❌ Template also failed for ${toNumber} [code:${tplErr.response?.data?.error?.code}]:`, JSON.stringify(tplErr.response?.data || tplErr.message));
       }
     } else {
-      console.error(`\u274C WA error to ${toNumber}:`, err.response?.data || err.message);
+      console.error(`❌ WA error to ${toNumber} (no report for template fallback):`, JSON.stringify(err.response?.data || err.message));
     }
   }
 }
