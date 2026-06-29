@@ -84,6 +84,17 @@ function ensureUniqueCode() {
 }
 
 /* =========================
+   FORMAT OPS LOG
+   Last N entries as string
+========================= */
+function formatOpsLog(report) {
+  const log = report.opsLog || [];
+  if (!log.length) return '';
+  const entries = log;
+  return '\n\n📋 *Ops Log:*\n' + entries.map(e => `[${e.time}] ${e.text}`).join('\n');
+}
+
+/* =========================
    WHATSAPP SEND - FREE FORM
 ========================= */
 async function sendFreeForm(toNumber, message) {
@@ -278,12 +289,13 @@ async function handleIncomingCommand(from, text) {
       report: title, title: title.slice(0, 60),
       description, assignee: '', priority: severity === 'critical' ? 'high' : 'normal',
       status: 'OPEN', source: 'whatsapp',
-      time: now(), updatedAt: now(), comments: [],
+      time: now(), updatedAt: now(), comments: [], opsLog: [],
       incidentType, nature, sector,
       latDeg, latMin, latDir, locationCode,
       reportedBy, attachment: ''
     };
 
+    report.opsLog.push({ time: now(), type: 'created', text: `🆕 OPEN — Created by ${reportedBy}` });
     reports.unshift(report);
 
     const locStr = formatLocation(report) !== 'N/A' ? `\n📍 ${formatLocation(report)}` : '';
@@ -340,11 +352,14 @@ async function handleIncomingCommand(from, text) {
     report.status = newStatus;
     report.updatedAt = now();
     const updaterName = resolveName(from);
+    if (!report.opsLog) report.opsLog = [];
+    report.opsLog.push({ time: now(), type: 'status', text: `${statusEmoji(newStatus)} ${old} → ${newStatus} — By: ${updaterName}` });
     const msg =
       `${statusEmoji(newStatus)} *Status Update*\n\n` +
       `${code} — ${report.title}\n` +
       `${old} → ${newStatus}\n` +
-      `By: ${updaterName}`;
+      `By: ${updaterName}` +
+      formatOpsLog(report);
     await broadcast(msg, null, report);
     return true;
   }
@@ -354,11 +369,13 @@ async function handleIncomingCommand(from, text) {
     const comment = { id: Date.now(), user: `+${from}`, message: rest, time: now() };
     report.comments.push(comment);
     report.updatedAt = now();
+    if (!report.opsLog) report.opsLog = [];
+    report.opsLog.push({ time: now(), type: 'comment', text: `💬 ${resolveName(from)}: ${rest}` });
     const msg =
       `💬 *Comment on ${code}*\n` +
       `"${report.title}"\n\n` +
-      `${resolveName(from)}: ${rest}\n\n` +
-      `↩️ Reply: ${code} <message>`;
+      `${resolveName(from)}: ${rest}` +
+      formatOpsLog(report);
     await broadcast(msg, from, report);
     // Confirm to sender
     await sendWhatsAppMessage(from, `✅ Comment added to ${code}`);
@@ -449,10 +466,12 @@ app.post('/api/report', async (req, res) => {
     id: Date.now(), shortCode, user, severity, report: message,
     title: title || message.slice(0, 60), description, assignee,
     priority, status: 'OPEN', source: 'dashboard',
-    time: now(), updatedAt: now(), comments: [],
+    time: now(), updatedAt: now(), comments: [], opsLog: [],
     incidentType, sector: sector || 'Unassigned',
     latDeg, latMin, latDir, locationCode, nature, reportedBy, attachment: ''
   };
+  // Seed ops log with creation entry
+  report.opsLog.push({ time: now(), type: 'created', text: `🆕 OPEN — Created by ${reportedBy}` });
 
   reports.unshift(report);
 
@@ -504,12 +523,14 @@ app.post('/api/reports/:id/status', async (req, res) => {
   const old = report.status;
   report.status = status;
   report.updatedAt = now();
+  if (!report.opsLog) report.opsLog = [];
+  report.opsLog.push({ time: now(), type: 'status', text: `${statusEmoji(status)} ${old} → ${status} — By: ${user} (dashboard)` });
   await broadcast(
     `${statusEmoji(status)} *Status Update*\n\n` +
     `${report.shortCode} — ${report.title}\n` +
     `${old} → ${status}\n` +
-    `By: ${user} (dashboard)\n\n` +
-    `↩️ Reply: *${report.shortCode} <message>* to comment`,
+    `By: ${user} (dashboard)` +
+    formatOpsLog(report),
     null, report
   );
   res.json({ success: true, report });
@@ -526,11 +547,13 @@ app.post('/api/reports/:id/comment', async (req, res) => {
   const comment = { id: Date.now(), user, message, time: now() };
   report.comments.push(comment);
   report.updatedAt = now();
+  if (!report.opsLog) report.opsLog = [];
+  report.opsLog.push({ time: now(), type: 'comment', text: `💬 ${user} (dashboard): ${message}` });
   await broadcast(
     `💬 *Comment on ${report.shortCode}*\n` +
     `"${report.title}"\n\n` +
-    `${user} (dashboard): ${message}\n\n` +
-    `↩️ Reply: *${report.shortCode} <message>* to respond`,
+    `${user} (dashboard): ${message}` +
+    formatOpsLog(report),
     null, report
   );
   res.json({ success: true, comment });
