@@ -43,14 +43,20 @@ let reports = [];
 let incomingMessages = [];
 const knownSenders = new Set(); // numbers that have messaged us — free-form allowed
 
-const VALID_SEVERITIES = ['low', 'medium', 'critical'];
+const VALID_SEVERITIES = ['L1', 'L2', 'L3 (Significant)', 'L3 (Minor)', 'L4'];
 const VALID_STATUSES = ['OPEN', 'IN_PROGRESS', 'RESOLVED'];
 
 function now() {
   return new Date().toISOString().replace('T', ' ').slice(0, 19);
 }
 function severityEmoji(s) {
-  return { low: '\u{1F7E1}', medium: '\u{1F7E0}', critical: '\u{1F534}' }[s] || '\u26AA';
+  return {
+    'L1': '\u{1F534}',
+    'L2': '\u{1F7E0}',
+    'L3 (Significant)': '\u{1F7E0}',
+    'L3 (Minor)': '\u{1F7E1}',
+    'L4': '\u{1F7E2}'
+  }[s] || '\u26AA';
 }
 function statusEmoji(s) {
   return { OPEN: '\u{1F195}', IN_PROGRESS: '\u{1F527}', RESOLVED: '\u2705' }[s] || '\u2753';
@@ -159,10 +165,10 @@ function buildTemplateParams(report) {
     report.incidentType || 'General',
     report.shortCode || '-',
     report.title || report.report || '-',
-    `${severityEmoji(report.severity)} ${(report.severity || '').toUpperCase()}`,
+    `${severityEmoji(report.severity)} ${report.severity || ''}`,
     (report.priority || 'normal').toUpperCase(),
-    report.nature || 'Unspecified',
-    report.sector || 'Unassigned',
+    report.incidentDateTime || report.time || '-',
+    report.locationCode || '-',
     report.reportedBy || '-',
     report.status || 'OPEN',
     report.report || report.title || '-',
@@ -241,16 +247,15 @@ async function handleIncomingCommand(from, text) {
       `INC-NEW\n` +
       `Title: \n` +
       `Type: General\n` +
-      `Nature: \n` +
-      `Severity: medium\n` +
-      `Sector: \n` +
+      `Severity: L3 (Significant)\n` +
+      `Date/Time: \n` +
       `Lat Deg: \n` +
       `Lat Min: \n` +
       `Lat Dir: N\n` +
       `Loc Code: \n` +
       `Reported By: \n` +
       `Description: \n\n` +
-      `Severity options: low / medium / critical`
+      `Severity options: L1 / L2 / L3 (Significant) / L3 (Minor) / L4`
     );
     return true;
   }
@@ -271,26 +276,33 @@ async function handleIncomingCommand(from, text) {
     }
 
     const incidentType  = get(/^Type:\s*(.+)$/im, 'General');
-    const nature        = get(/^Nature:\s*(.+)$/im, 'Unspecified');
-    const severityRaw   = get(/^Severity:\s*(.+)$/im, 'medium').toLowerCase();
-    const sector        = get(/^Sector:\s*(.+)$/im, 'Unassigned');
+    const severityRaw   = get(/^Severity:\s*(.+)$/im, 'L3 (Significant)').trim().toUpperCase();
     const latDeg        = get(/^Lat Deg:\s*(\d*)$/im, '');
     const latMin        = get(/^Lat Min:\s*(\d*)$/im, '');
     const latDir        = get(/^Lat Dir:\s*([NSEWnsew])$/im, 'N').toUpperCase();
     const locationCode  = get(/^Loc Code:\s*(.+)$/im, '');
     const reportedBy    = get(/^Reported By:\s*(.+)$/im, `+${from}`);
     const description   = get(/^Description:\s*([\s\S]+)$/im, '');
-    const severity      = VALID_SEVERITIES.includes(severityRaw) ? severityRaw : 'medium';
+    const incidentDateTime = get(/^Date\s*\/?\s*Time:\s*(.+)$/im, now());
+
+    // Normalize severity input (L1, L2, L3 SIG, L3 MINOR, L4) to canonical form
+    const sevMap = {
+      'L1': 'L1', 'L2': 'L2', 'L4': 'L4',
+      'L3': 'L3 (Significant)',
+      'L3 (SIGNIFICANT)': 'L3 (Significant)', 'L3 SIGNIFICANT': 'L3 (Significant)', 'L3 SIG': 'L3 (Significant)',
+      'L3 (MINOR)': 'L3 (Minor)', 'L3 MINOR': 'L3 (Minor)'
+    };
+    const severity = sevMap[severityRaw] || (VALID_SEVERITIES.includes(severityRaw) ? severityRaw : 'L3 (Significant)');
 
     const shortCode = ensureUniqueCode();
     const report = {
       id: Date.now(), shortCode,
       user: `+${from}`, severity,
       report: title, title: title.slice(0, 60),
-      description, assignee: '', priority: severity === 'critical' ? 'high' : 'normal',
+      description, assignee: '', priority: severity === 'L1' ? 'high' : 'normal',
       status: 'OPEN', source: 'whatsapp',
       time: now(), updatedAt: now(), comments: [], opsLog: [],
-      incidentType, nature, sector,
+      incidentType, incidentDateTime,
       latDeg, latMin, latDir, locationCode,
       reportedBy, attachment: ''
     };
@@ -306,7 +318,7 @@ async function handleIncomingCommand(from, text) {
       `✅ *Incident Created*\n\n` +
       `🔖 Code: *${shortCode}*\n` +
       `Title: ${title}\n` +
-      `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n\n` +
+      `Severity: ${severityEmoji(severity)} ${severity}\n\n` +
       `Live on the dashboard.\n\n` +
       `↩️ Use *${shortCode} <message>* to add updates`
     );
@@ -315,10 +327,8 @@ async function handleIncomingCommand(from, text) {
     await broadcast(
       `🚨 *NEW INCIDENT [${incidentType.toUpperCase()}]*\n\n` +
       `🔖 Code: *${shortCode}*\n` +
-      `Title: ${title}\n` +
-      `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n` +
-      `Nature: ${nature}\n` +
-      `Sector: ${sector}\n` +
+      `Severity: ${severityEmoji(severity)} ${severity}\n` +
+      `Date/Time: ${incidentDateTime}\n` +
       `Reporter: ${reportedBy}\n` +
       `Status: 🆕 OPEN` +
       locStr + descStr +
@@ -386,10 +396,10 @@ async function handleIncomingCommand(from, text) {
   const locStr = formatLocation(report) !== 'N/A' ? `\n📍 ${formatLocation(report)}` : '';
   await sendWhatsAppMessage(from,
     `📋 *${code} — ${report.title}*\n\n` +
-    `Severity: ${severityEmoji(report.severity)} ${report.severity.toUpperCase()}\n` +
+    `Severity: ${severityEmoji(report.severity)} ${report.severity}\n` +
     `Status: ${statusEmoji(report.status)} ${report.status}\n` +
-    `Reporter: ${report.reportedBy || '—'}\n` +
-    `Sector: ${report.sector || '—'}` +
+    `Date/Time: ${report.incidentDateTime || report.time}\n` +
+    `Reporter: ${report.reportedBy || '—'}` +
     locStr + '\n\n' +
     `↩️ Reply: ${code} <message> to comment\n` +
     `↩️ Reply: ${code} RESOLVE / PROGRESS / OPEN to update status`
@@ -451,10 +461,10 @@ app.post('/', async (req, res) => {
 ========================= */
 app.post('/api/report', async (req, res) => {
   const {
-    severity = 'low', message, user = 'dashboard', title = '', description = '',
+    severity = 'L3 (Significant)', message, user = 'dashboard', title = '', description = '',
     assignee = '', priority = 'normal', incidentType = 'General', sector = '',
     latDeg = '', latMin = '', latDir = 'N', locationCode = '',
-    nature = 'General Outage', reportedBy = 'Dashboard Operator'
+    nature = '', reportedBy = 'Dashboard Operator', incidentDateTime = ''
   } = req.body;
 
   if (!message) return res.status(400).json({ error: 'Message required' });
@@ -468,7 +478,8 @@ app.post('/api/report', async (req, res) => {
     priority, status: 'OPEN', source: 'dashboard',
     time: now(), updatedAt: now(), comments: [], opsLog: [],
     incidentType, sector: sector || 'Unassigned',
-    latDeg, latMin, latDir, locationCode, nature, reportedBy, attachment: ''
+    latDeg, latMin, latDir, locationCode, nature, reportedBy,
+    incidentDateTime: incidentDateTime || now(), attachment: ''
   };
   // Seed ops log with creation entry
   report.opsLog.push({ time: now(), type: 'created', text: `🆕 OPEN — Created by ${reportedBy}` });
@@ -476,20 +487,15 @@ app.post('/api/report', async (req, res) => {
   reports.unshift(report);
 
   const locStr = formatLocation(report) !== 'N/A' ? `\n📍 Location: ${formatLocation(report)}` : '';
-  const assigneeStr = assignee ? `\n👤 Assignee: @${assignee}` : '';
   const descStr = description ? `\n\n📋 ${description}` : '';
 
   await broadcast(
     `🚨 *NEW INCIDENT [${incidentType.toUpperCase()}]*\n\n` +
     `🔖 Code: *${shortCode}*\n` +
-    `Title: ${report.title}\n` +
-    `Severity: ${severityEmoji(severity)} ${severity.toUpperCase()}\n` +
-    `Priority: ${priority.toUpperCase()}\n` +
-    `Nature: ${nature}\n` +
-    `Sector: ${sector || 'Unassigned'}\n` +
-    `Reporter: ${reportedBy}\n` +
+    `Severity: ${severityEmoji(severity)} ${severity}\n` +
+    `Date/Time: ${report.incidentDateTime}\n` +
     `Status: 🆕 OPEN` +
-    locStr + assigneeStr +
+    locStr +
     `\n\n💬 ${message}` + descStr +
     `\n\n↩️ Reply: *${shortCode} <message>* to comment\n` +
     `↩️ Reply: *${shortCode} RESOLVE / PROGRESS* to update status`,
@@ -631,17 +637,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .card:hover { background:var(--surface2); border-color:var(--border2); }
     .card.on { background:var(--surface2); border-color:var(--accent); }
     .sev-bar { position:absolute; left:5px; top:7px; bottom:7px; width:3px; border-radius:2px; }
-    .sev-bar.low { background:var(--sev-low); }
-    .sev-bar.medium { background:var(--sev-med); }
-    .sev-bar.critical { background:var(--sev-crit); }
+    .sev-bar.sev-L1 { background:var(--sev-crit); }
+    .sev-bar.sev-L2 { background:var(--sev-med); }
+    .sev-bar.sev-L3-Significant { background:var(--sev-med); }
+    .sev-bar.sev-L3-Minor { background:var(--sev-low); }
+    .sev-bar.sev-L4 { background:#34d399; }
     .card-title { font-size:12px; font-weight:600; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .card-code { font-family:'Roboto Mono',monospace; font-size:9px; color:var(--accent); margin-bottom:5px; }
     .card-meta { display:flex; gap:4px; align-items:center; flex-wrap:wrap; }
 
     .badge { display:inline-flex; align-items:center; padding:2px 6px; border-radius:4px; font-size:9px; font-weight:700; font-family:'Roboto Mono',monospace; letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
-    .b-low { background:var(--sev-low-bg); color:var(--sev-low); }
-    .b-medium { background:var(--sev-med-bg); color:var(--sev-med); }
-    .b-critical { background:var(--sev-crit-bg); color:var(--sev-crit); }
+    .b-sev-L1 { background:var(--sev-crit-bg); color:var(--sev-crit); }
+    .b-sev-L2 { background:var(--sev-med-bg); color:var(--sev-med); }
+    .b-sev-L3-Significant { background:var(--sev-med-bg); color:var(--sev-med); }
+    .b-sev-L3-Minor { background:var(--sev-low-bg); color:var(--sev-low); }
+    .b-sev-L4 { background:#071a0f; color:#34d399; }
     .b-OPEN { background:var(--st-open-bg); color:var(--st-open); }
     .b-IN_PROGRESS { background:var(--st-prog-bg); color:var(--st-prog); }
     .b-RESOLVED { background:var(--st-res-bg); color:var(--st-res); }
@@ -750,9 +760,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <button class="chip" data-f="OPEN">Open</button>
       <button class="chip" data-f="IN_PROGRESS">In Progress</button>
       <button class="chip" data-f="RESOLVED">Resolved</button>
-      <button class="chip" data-f="critical">Critical</button>
-      <button class="chip" data-f="medium">Medium</button>
-      <button class="chip" data-f="low">Low</button>
+      <button class="chip" data-f="L1">L1</button>
+      <button class="chip" data-f="L2">L2</button>
+      <button class="chip" data-f="L3 (Significant)">L3 (Sig.)</button>
+      <button class="chip" data-f="L3 (Minor)">L3 (Minor)</button>
+      <button class="chip" data-f="L4">L4</button>
     </div>
     <div class="inc-list" id="inc-list"></div>
   </div>
@@ -774,6 +786,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
   function ini(n) { return String(n||'?').replace(/[+@]/g,'').slice(0,2).toUpperCase(); }
   function isWaSource(user) { return user && user.startsWith('+'); }
+  function sevClass(s) { return 'sev-' + String(s||'').replace(/[^A-Za-z0-9]+/g,'-').replace(/-+$/,''); }
 
   function field(label, value, cls, req) {
     return '<div class="dv-field">' +
@@ -818,14 +831,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   /* ── RENDER LIST ── */
   function renderList() {
     var q = (document.getElementById('search').value||'').toLowerCase();
+    var statusFilters = ['OPEN','IN_PROGRESS','RESOLVED'];
     var list = all.filter(r=>{
-      if (activeFilter==='critical'||activeFilter==='medium'||activeFilter==='low') {
-        if (r.severity!==activeFilter) return false;
-      } else if (activeFilter) {
-        if (r.status!==activeFilter) return false;
+      if (activeFilter) {
+        if (statusFilters.indexOf(activeFilter) !== -1) {
+          if (r.status!==activeFilter) return false;
+        } else {
+          if (r.severity!==activeFilter) return false;
+        }
       }
       if (q) {
-        var hay = [r.title,r.report,r.user,r.shortCode,r.incidentType,r.nature,r.reportedBy,r.sector,r.locationCode].join(' ').toLowerCase();
+        var hay = [r.title,r.report,r.user,r.shortCode,r.incidentType,r.reportedBy,r.locationCode].join(' ').toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -840,11 +856,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       var prefix = r.incidentType ? '['+esc(r.incidentType)+'] ' : '';
       var t = (r.time||'').slice(5,16);
       return '<div class="card'+active+'" data-id="'+r.id+'">' +
-        '<div class="sev-bar '+esc(r.severity)+'"></div>' +
+        '<div class="sev-bar '+sevClass(r.severity)+'"></div>' +
         '<div class="card-code">'+esc(r.shortCode||'—')+'</div>' +
         '<div class="card-title">'+prefix+esc(r.title||r.report)+'</div>' +
         '<div class="card-meta">' +
-          '<span class="badge b-'+esc(r.severity)+'">'+esc(r.severity)+'</span>' +
+          '<span class="badge b-'+sevClass(r.severity)+'">'+esc(r.severity)+'</span>' +
           '<span class="badge b-'+esc(r.status)+'">'+r.status.replace('_',' ')+'</span>' +
           '<span style="font-size:10px;color:var(--muted2);margin-left:auto;">'+t+'</span>' +
         '</div></div>';
@@ -896,7 +912,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           '<div class="detail-id">#'+r.id+'</div>' +
         '</div>' +
         '<div class="detail-badges">' +
-          '<span class="badge b-'+esc(r.severity)+'">'+esc(r.severity)+'</span>' +
+          '<span class="badge b-'+sevClass(r.severity)+'">'+esc(r.severity)+'</span>' +
           '<span class="badge b-'+esc(r.status)+'">'+r.status.replace('_',' ')+'</span>' +
           '<span class="badge b-wa">WhatsApp</span>' +
         '</div>' +
@@ -911,11 +927,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         '<div class="dv-section">' +
           row(2,
             '<div class="dv-field"><div class="dv-label">Incident Code</div><div class="dv-val code">'+esc(r.shortCode||'—')+'</div></div>' +
-            field('Report Type', r.incidentType||'General')
+            field('Incident Type', r.incidentType||'General','',true)
           ) +
-          row(2, field('Report Title', r.title||r.report) + field('Severity', r.severity)) +
-          row(2, field('Reported By', r.reportedBy||'—','',true) + field('Nature of Incident', r.nature||'Unspecified','',true)) +
-          row(2, field('Sector', r.sector||'Unassigned') + field('Assignee', assigneeVal)) +
+          row(2, field('Severity', r.severity,'',true) + field('Date and Time of Incident', r.incidentDateTime||r.time,'mono',true)) +
           row(2, field('Created', r.time,'mono') + field('Last Updated', r.updatedAt||r.time,'mono')) +
         '</div>' +
         '<div class="dv-section">' +
@@ -956,6 +970,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       var b3=document.createElement('button'); b3.className='btn btn-danger'; b3.textContent='Reopen';
       b3.addEventListener('click',()=>setStatus(r.id,'OPEN')); actionRow.appendChild(b3);
     }
+
+    // Ops Update button — prefills comment box with INC-XXXX
+    var bOps = document.createElement('button');
+    bOps.className = 'btn btn-ghost';
+    bOps.textContent = 'Ops Update';
+    bOps.addEventListener('click', function(){
+      var input = document.getElementById('c-input');
+      input.value = r.shortCode + ' ';
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+    });
+    actionRow.appendChild(bOps);
 
     document.getElementById('c-send').addEventListener('click',()=>addComment(r.id));
     document.getElementById('c-input').addEventListener('keydown',function(e){
@@ -1062,6 +1088,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   /* ── NEW INCIDENT FORM ── */
   function renderNewForm() {
     var panel = document.getElementById('detail-panel');
+    var nowLocal = new Date(Date.now() - new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);
     panel.innerHTML =
       '<div class="detail-head">' +
         '<div class="detail-title-row"><div class="detail-title">New Incident Report</div></div>' +
@@ -1071,24 +1098,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       '<div class="dv-scroll">' +
         '<div class="dv-section">' +
           '<div class="dv-row col2">' +
-            '<div class="dv-field"><div class="dv-label req">Report Title</div><input class="dv-input" id="nf-title" placeholder="Short descriptive title"></div>' +
-            '<div class="dv-field"><div class="dv-label">Report Type</div><input class="dv-input" id="nf-type" placeholder="Outage, Cyber, Leak…"></div>' +
-          '</div>' +
-          '<div class="dv-row col2">' +
-            '<div class="dv-field"><div class="dv-label req">Nature of Incident</div><input class="dv-input" id="nf-nature" placeholder="Fiber Cut, Power Drop…"></div>' +
+            '<div class="dv-field"><div class="dv-label req">Incident Type</div><input class="dv-input" id="nf-type" placeholder="Outage, Cyber, Leak…"></div>' +
             '<div class="dv-field"><div class="dv-label">Severity</div>' +
-              '<select class="dv-input" id="nf-sev"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="critical">Critical</option></select>' +
+              '<select class="dv-input" id="nf-sev">' +
+                '<option value="L1">L1</option>' +
+                '<option value="L2">L2</option>' +
+                '<option value="L3 (Significant)" selected>L3 (Significant)</option>' +
+                '<option value="L3 (Minor)">L3 (Minor)</option>' +
+                '<option value="L4">L4</option>' +
+              '</select>' +
             '</div>' +
           '</div>' +
-          '<div class="dv-row col2">' +
-            '<div class="dv-field"><div class="dv-label">Sector</div><input class="dv-input" id="nf-sector" placeholder="Sector 4, Alpha, North-Zone"></div>' +
-            '<div class="dv-field"><div class="dv-label">Priority</div>' +
-              '<select class="dv-input" id="nf-pri"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select>' +
-            '</div>' +
-          '</div>' +
-          '<div class="dv-row col2">' +
-            '<div class="dv-field"><div class="dv-label req">Reported By</div><input class="dv-input" id="nf-reportedby" placeholder="Name / Unit"></div>' +
-            '<div class="dv-field"><div class="dv-label">Assignee</div><input class="dv-input" id="nf-assignee" placeholder="@username"></div>' +
+          '<div class="dv-row col1">' +
+            '<div class="dv-field"><div class="dv-label req">Date and Time of Incident</div><input class="dv-input" id="nf-datetime" type="datetime-local" value="'+nowLocal+'"></div>' +
           '</div>' +
         '</div>' +
         '<div class="dv-section">' +
@@ -1128,27 +1150,25 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         '<div style="font-size:14px;font-weight:600;">Select an incident</div>' +
         '<div style="font-size:12px;margin-top:2px;">or create one with + New Incident</div></div>';
     });
-    document.getElementById('nf-title').focus();
+    document.getElementById('nf-type').focus();
   }
 
   function submitReport() {
-    var title = document.getElementById('nf-title').value.trim();
-    if (!title) { document.getElementById('nf-title').focus(); return; }
+    var incidentType = document.getElementById('nf-type').value.trim();
+    var msg = document.getElementById('nf-msg').value.trim();
+    if (!incidentType) { document.getElementById('nf-type').focus(); return; }
+    if (!msg) { document.getElementById('nf-msg').focus(); return; }
     var body = {
-      title, user:'dashboard',
-      incidentType: document.getElementById('nf-type').value.trim()||'General',
-      nature: document.getElementById('nf-nature').value.trim()||'Unspecified',
+      title: msg, user:'dashboard',
+      incidentType: incidentType,
       severity: document.getElementById('nf-sev').value,
-      priority: document.getElementById('nf-pri').value,
-      sector: document.getElementById('nf-sector').value.trim(),
+      incidentDateTime: document.getElementById('nf-datetime').value,
       latDeg: document.getElementById('nf-latdeg').value.trim(),
       latMin: document.getElementById('nf-latmin').value.trim(),
       latDir: document.getElementById('nf-latdir').value,
       locationCode: document.getElementById('nf-loccode').value.trim(),
-      reportedBy: document.getElementById('nf-reportedby').value.trim()||'Dashboard Operator',
-      assignee: document.getElementById('nf-assignee').value.trim(),
       description: document.getElementById('nf-desc').value.trim(),
-      message: document.getElementById('nf-msg').value.trim()||title
+      message: msg
     };
     fetch('/api/report', {
       method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
