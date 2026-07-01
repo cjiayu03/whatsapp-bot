@@ -69,24 +69,13 @@ function formatLocation(r) {
 }
 
 /* =========================
-   SHORT CODE GENERATOR
+   RUNNING INCIDENT CODE
+   INC-0001, INC-0002, ...
 ========================= */
-function generateShortCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 4; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return 'INC-' + code;
-}
+let incidentCounter = 0;
 function ensureUniqueCode() {
-  let code;
-  let attempts = 0;
-  do {
-    code = generateShortCode();
-    attempts++;
-  } while (reports.find(r => r.shortCode === code) && attempts < 100);
-  return code;
+  incidentCounter++;
+  return 'INC-' + String(incidentCounter).padStart(4, '0');
 }
 
 /* =========================
